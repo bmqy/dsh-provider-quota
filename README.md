@@ -1,10 +1,12 @@
-# 供应商余量（DSH 本地插件）
+# 供应商余量（DSH 插件）
 
 ![紧凑态](docs/compact.png)
 
 ![悬停明细](docs/hover.png)
 
-在对话框输入框上方常驻一行，用**紧凑形式**列出所有已配置供应商的套餐余量；
+在对话框输入框上方常驻一行，用**紧凑形式**列出有内置适配器的供应商的套餐余量
+（目前是 `opencode-go`、`command-code`，以及不在 LLM 注册表里的本地 `codex` CLI；
+自建中转等没有可查余量接口的供应商不会出现）；
 鼠标悬停某个供应商徽标，弹出完整明细（5 小时 / 每周 / 每月窗口、已用与剩余、
 重置倒计时与具体时刻、套餐名、读取时间）。点这一行会立即重读（绕过 45 秒缓存）。
 
@@ -69,6 +71,23 @@ command-code · 套餐 GOAT · 已用尽
 - 读取失败时保留上一次数字；从未成功过则显示「读取失败」，不会挤占布局。
 
 ## 安装
+
+仓库自带 `dsh.bundle` 清单（`package.json` 的 `dsh.bundle.patch` → `cordis.patch.yml`），所以能直接当插件装：
+
+```sh
+dsh plugin --profile web add github:bmqy/dsh-provider-quota
+
+# 想钉住版本就用提交号（GitHub 源码安装会执行安装期脚本，钉住更稳）
+dsh plugin --profile web add github:bmqy/dsh-provider-quota#<commit-sha>
+```
+
+装完重启 DSH。从 GitHub 源码安装时 pnpm 会拦下安装期构建脚本，`dsh` 会打印出要加进配置档
+`pnpm-workspace.yaml` 里 `allowBuilds` 的键——照提示加一次、重试即可（本插件自身没有构建步骤）。
+
+本仓库**没有发布到 npm**，所以 `dsh plugin add dsh-provider-quota` 这种按包名解析的写法不可用，
+请走上面的 `github:` 形式。
+
+### 开发时（改文件即时生效）
 
 - 插件目录：`~/.dsh/profiles/<profile>/plugins/provider-quota/`
   （Windows 上是 `C:\Users\<你>\.dsh\profiles\<profile>\plugins\provider-quota\`）。

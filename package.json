@@ -3,7 +3,26 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "在对话输入框下方常驻展示所有已配置模型供应商的套餐余量（5 小时 / 每周 / 每月）。",
+  "description": "在输入框上方常驻一行，显示有内置适配器的供应商（opencode-go、command-code、本地 codex CLI）的套餐余量：5 小时 / 每周 / 每月窗口的剩余比例与重置倒计时。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "quota",
+    "usage",
+    "balance",
+    "provider"
+  ],
+  "license": "MIT",
+  "author": "bmqy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bmqy/dsh-provider-quota.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bmqy/dsh-provider-quota/issues"
+  },
+  "homepage": "https://github.com/bmqy/dsh-provider-quota#readme",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
@@ -16,7 +35,9 @@
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "README.md"
+    "screenshots.json",
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
