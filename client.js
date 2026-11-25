@@ -9,9 +9,12 @@
 // opens a card with every window: 5-hour, weekly, monthly, used vs remaining,
 // absolute and relative reset time, plan tier and fetch time.
 //
-// Placement: `conversation.input.dock` (the full-width band directly above the
-// composer card, shared with the todo and goal docks). Order 5 keeps it above
-// the queue dock (20).
+// Placement: `conversation.input.dock` (the strip directly above the composer
+// card, shared with the todo and goal strips). Order 5 keeps it above the queue
+// dock (20). The strip is drawn as the same card the goal strip uses — 12px
+// radius, elevation panel stroke + shadow, menu surface on a backdrop-blurred
+// layer, 16px inside the composer card — because this band floats over the
+// thread and message text keeps scrolling underneath it.
 
 window.__ModuleLoader__.load({
   id: '@local/dsh-provider-quota',
@@ -107,20 +110,54 @@ window.__ModuleLoader__.load({
       balance: 'balance',
     }
 
+    // Geometry of a dock strip, taken from the shipped goal strip: the outer
+    // element reserves the composer's side clearance plus the dock inset, the
+    // inner card caps at the composer card width minus four insets and centres
+    // itself, so every strip in this dock lines up 16px inside the composer
+    // card.
+    const dockStyle = {
+      boxSizing: 'border-box',
+      width: 'calc(100% - 2 * var(--dsh-composer-side-clearance, 16px) - 4 * var(--dsh-composer-dock-inset, 8px))',
+      margin: '0 auto',
+    }
+    // Card of a dock strip, copied 1:1 from the goal strip of the running app
+    // (`@deepseek-ai/dsh-client-ui-goal` · `.Gc24Bq_bar`): 12px radius token, no
+    // border — the half-pixel stroke comes from `--dsw-elevation-panel`, which
+    // reads `--dsw-elevation-stroke-color` — plus that same panel shadow, 36px
+    // tall, and the menu surface (`rgba(252,253,254,.7)` + 40px backdrop blur)
+    // painted on a layer under the content. Two notes:
+    // · minHeight instead of height, so a narrow pane that wraps the chips
+    //   grows the card instead of clipping it;
+    // · the fill is not decoration — this strip floats over the thread, so
+    //   without it message text scrolls visibly between the chips.
+    const fillStyle = {
+      position: 'absolute',
+      inset: 0,
+      zIndex: 0,
+      borderRadius: 'inherit',
+      background: 'var(--dsw-specific-menu, var(--dsw-menu-surface-fill, #fff))',
+      backdropFilter: 'var(--dsw-menu-backdrop-filter, blur(40px) saturate(150%))',
+      pointerEvents: 'none',
+    }
     const rootStyle = {
+      isolation: 'isolate',
+      boxSizing: 'border-box',
       position: 'relative',
       display: 'flex',
       alignItems: 'center',
       flexWrap: 'wrap',
       gap: '4px 14px',
-      flex: '1 1 auto',
-      margin: '2px 0 0',
-      padding: '0 4px',
-      // Align with the composer's own text: the card is centred in this dock
-      // and its textarea pads 14px, so the row starts exactly under the
-      // placeholder's first character.
-      paddingLeft: 'max(0px, calc((100% - var(--dsh-composer-card-max-width, 712px)) / 2 + 8px))',
-      paddingRight: 'max(0px, calc((100% - var(--dsh-composer-card-max-width, 712px)) / 2 + 8px))',
+      width: '100%',
+      maxWidth: 'calc(var(--dsh-composer-card-max-width, 712px) - 4 * var(--dsh-composer-dock-inset, 8px))',
+      minHeight: '36px',
+      margin: '0 auto',
+      // Chips carry their own 6px side padding, so this puts the first mark
+      // 12px from the card edge — the goal strip's own left inset.
+      padding: '4px 6px',
+      border: 0,
+      borderRadius: 'var(--dsw-radius-md, 12px)',
+      '--dsw-elevation-stroke-color': 'var(--dsw-alias-border-l1)',
+      boxShadow: 'var(--dsw-elevation-panel, 0 0 0 0.5px var(--dsw-alias-border-l1))',
       fontSize: '12px',
       lineHeight: '18px',
       color: 'var(--dsw-alias-label-secondary)',
@@ -128,6 +165,8 @@ window.__ModuleLoader__.load({
     }
     const chipStyle = {
       position: 'relative',
+      // Above the card's own fill layer.
+      zIndex: 1,
       display: 'inline-flex',
       alignItems: 'center',
       gap: '5px',
@@ -137,15 +176,43 @@ window.__ModuleLoader__.load({
       whiteSpace: 'nowrap',
       cursor: 'default',
     }
-    const chipActiveStyle = {
-      background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.12))',
+    // Open (hover/focus) cue: no fill on the chip — an SVG arch with a curved
+    // upper edge and a straight baseline. It sits below the provider figures,
+    // and stays mounted while closed so opacity/position can fade both ways.
+    const chipHoverStyle = {
+      color: 'var(--dsw-alias-label-primary)',
     }
+    const chipArcStyle = {
+      position: 'absolute',
+      left: '4px',
+      // The SVG's flat baseline aligns with the strip card's lower edge;
+      // closed rests below it, then rises into place on hover/focus.
+      bottom: '-10px',
+      width: 'calc(100% - 8px)',
+      height: '7px',
+      overflow: 'visible',
+      opacity: 0,
+      transform: 'translateY(4px)',
+      transition: 'opacity 180ms ease-out, transform 180ms ease-out',
+      pointerEvents: 'none',
+    }
+    const chipArcVisibleStyle = {
+      opacity: 1,
+      transform: 'translateY(0)',
+    }
+    const chipArcPath = 'M 0 4 Q 50 -1 100 4 L 100 6 L 0 6 Z'
+    const chipArcFill = 'var(--dsw-alias-interactive-bg-hover, rgba(38, 49, 72, 0.06))'
+    // Every provider mark occupies the same 16px layout box. The Codex favicon
+    // has more internal padding than the adjacent square favicons, so optically
+    // enlarge its artwork while keeping the box (and text alignment) unchanged.
+    const MARK_SIZE = 16
+    const MARK_ICON_SCALE = { codex: 4 / 3, 'openai-codex': 4 / 3 }
     const markStyle = {
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
-      width: '16px',
-      height: '16px',
+      width: `${MARK_SIZE}px`,
+      height: `${MARK_SIZE}px`,
       borderRadius: '5px',
       fontSize: '9px',
       fontWeight: 600,
@@ -187,6 +254,27 @@ window.__ModuleLoader__.load({
       fontSize: '12.5px',
       margin: '0 0 6px',
     }
+    const loadingBodyStyle = {
+      position: 'relative',
+      zIndex: 1,
+      display: 'flex',
+      alignItems: 'center',
+      gap: '10px',
+      width: '100%',
+      padding: '2px 6px',
+    }
+    const loadingSpinnerStyle = {
+      display: 'block',
+      flex: '0 0 auto',
+      width: '18px',
+      height: '18px',
+    }
+    const loadingLabelStyle = {
+      color: 'var(--dsw-alias-label-primary)',
+      fontSize: '13px',
+      fontWeight: 500,
+      lineHeight: '18px',
+    }
     const tierTextStyle = {
       color: 'var(--dsw-alias-label-tertiary)',
       fontSize: '11px',
@@ -196,7 +284,9 @@ window.__ModuleLoader__.load({
       position: 'relative',
       height: '4px',
       borderRadius: '999px',
-      background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.18))',
+      // --dsw-alias-bg-layer-2 is #fff in the light theme, i.e. invisible on the
+      // card; a surface tint keeps the groove visible in both themes.
+      background: 'var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,0.18))',
       overflow: 'hidden',
     }
     const noteStyle = {
@@ -324,12 +414,22 @@ window.__ModuleLoader__.load({
     function ProviderMark({ provider }) {
       const icon = MARK_ICONS[provider] ?? MARK_ICONS[MARK_ALIASES[provider]]
       if (icon !== undefined) {
+        const scale = MARK_ICON_SCALE[provider] ?? 1
         return h('img', {
           src: icon,
           alt: '',
-          width: 16,
-          height: 16,
-          style: { width: '16px', height: '16px', borderRadius: '3px', display: 'block', flex: '0 0 auto' },
+          width: MARK_SIZE,
+          height: MARK_SIZE,
+          style: {
+            width: `${MARK_SIZE}px`,
+            height: `${MARK_SIZE}px`,
+            objectFit: 'contain',
+            transform: scale === 1 ? undefined : `scale(${scale})`,
+            transformOrigin: 'center',
+            borderRadius: '3px',
+            display: 'block',
+            flex: '0 0 auto',
+          },
         })
       }
       return h('span', { style: markStyle }, markOf(provider))
@@ -411,7 +511,7 @@ window.__ModuleLoader__.load({
         : ''
       const failed = entry.status === 'error' || !hasData
       return h('span', {
-        style: open ? { ...chipStyle, ...chipActiveStyle } : chipStyle,
+        style: open ? { ...chipStyle, ...chipHoverStyle } : chipStyle,
         onMouseEnter: onOpen,
         onMouseLeave: onClose,
         onFocus: onOpen,
@@ -421,6 +521,16 @@ window.__ModuleLoader__.load({
         title: entry.providerName ?? entry.provider,
         'aria-label': entry.providerName ?? entry.provider,
       },
+      h('svg', {
+        key: 'arc',
+        style: open ? { ...chipArcStyle, ...chipArcVisibleStyle } : chipArcStyle,
+        viewBox: '0 0 100 7',
+        preserveAspectRatio: 'none',
+        'aria-hidden': true,
+        focusable: false,
+      },
+      h('path', { d: chipArcPath, fill: chipArcFill }),
+      ),
       h(ProviderMark, { provider: entry.provider }),
       failed
         ? h('span', { style: { color: SEVERITY_COLOR.danger } }, failureLabel(entry, t))
@@ -448,7 +558,9 @@ window.__ModuleLoader__.load({
     function QuotaBar({ t }) {
       const [view, setView] = React.useState({ phase: 'loading', providers: [], intervalSec: 60 })
       const [nonce, setNonce] = React.useState(0)
+      const [refreshing, setRefreshing] = React.useState(false)
       const [openProvider, setOpenProvider] = React.useState(null)
+      const refreshRequestRef = React.useRef(false)
       const loadRef = React.useRef(null)
       const aliveRef = React.useRef(true)
 
@@ -459,6 +571,7 @@ window.__ModuleLoader__.load({
           try {
             const value = await readState(refresh, controller.signal)
             if (!aliveRef.current) return
+            setRefreshing(false)
             setView({
               phase: value.providers.length === 0 ? 'empty' : 'ready',
               providers: value.providers,
@@ -466,13 +579,16 @@ window.__ModuleLoader__.load({
             })
           } catch {
             if (!aliveRef.current) return
+            setRefreshing(false)
             setView((current) => (
               current.phase === 'ready' ? current : { phase: 'error', providers: [], intervalSec: 60 }
             ))
           }
         }
         loadRef.current = load
-        void load(false)
+        const forceRefresh = refreshRequestRef.current
+        refreshRequestRef.current = false
+        void load(forceRefresh)
         return () => {
           aliveRef.current = false
           controller.abort()
@@ -490,39 +606,84 @@ window.__ModuleLoader__.load({
       const onRowLeave = () => { setOpenProvider(null) }
 
       if (view.phase === 'empty') return null
-      const refresh = () => { setNonce((value) => value + 1) }
-      if (view.phase === 'loading') {
-        return h('div', { style: rootStyle, 'aria-label': t('label') },
-          h('span', null, t('loading')),
+      const refresh = () => {
+        refreshRequestRef.current = true
+        setRefreshing(true)
+        setNonce((value) => value + 1)
+      }
+      if (view.phase === 'loading' || refreshing) {
+        return h('div', { style: dockStyle },
+          h('div', {
+            style: rootStyle,
+            role: 'status',
+            'aria-label': t('loading'),
+            'aria-live': 'polite',
+          },
+          h('div', { style: fillStyle, 'aria-hidden': true }),
+          h('div', { style: loadingBodyStyle },
+            h('svg', { style: loadingSpinnerStyle, viewBox: '0 0 24 24', 'aria-hidden': true, focusable: false },
+              h('g', null,
+                h('circle', {
+                  cx: 12, cy: 12, r: 9,
+                  fill: 'none',
+                  stroke: 'var(--dsw-alias-interactive-bg-active, rgba(127,127,127,0.2))',
+                  strokeWidth: 3,
+                }),
+                h('path', {
+                  d: 'M12 3a9 9 0 0 1 9 9',
+                  fill: 'none',
+                  stroke: 'var(--dsw-alias-brand-primary, #3d72f6)',
+                  strokeWidth: 3,
+                  strokeLinecap: 'round',
+                }),
+                h('animateTransform', {
+                  attributeName: 'transform',
+                  type: 'rotate',
+                  from: '0 12 12',
+                  to: '360 12 12',
+                  dur: '800ms',
+                  repeatCount: 'indefinite',
+                }),
+              ),
+            ),
+            h('div', { style: loadingLabelStyle }, t('loading')),
+          ),
+          ),
         )
       }
       if (view.phase === 'error') {
-        return h('div', {
-          style: { ...rootStyle, cursor: 'pointer' },
-          title: t('refresh'),
-          onClick: refresh,
-          role: 'status',
-          'aria-label': t('label'),
-        },
-        h('span', null, t('unavailable')),
+        return h('div', { style: dockStyle },
+          h('div', {
+            style: { ...rootStyle, cursor: 'pointer' },
+            title: t('refresh'),
+            onClick: refresh,
+            role: 'status',
+            'aria-label': t('label'),
+          },
+          h('div', { style: fillStyle, 'aria-hidden': true }),
+          h('span', null, t('unavailable')),
+          ),
         )
       }
-      return h('div', {
-        style: rootStyle,
-        role: 'status',
-        title: t('refresh'),
-        'aria-label': t('label'),
-        onMouseLeave: onRowLeave,
-        onClick: refresh,
-      },
-      view.providers.map((entry) => h(ProviderChip, {
-        key: entry.provider,
-        entry,
-        t,
-        open: openProvider === entry.provider,
-        onOpen: () => { setOpenProvider(entry.provider) },
-        onClose: () => { setOpenProvider((current) => (current === entry.provider ? null : current)) },
-      })),
+      return h('div', { style: dockStyle },
+        h('div', {
+          style: rootStyle,
+          role: 'status',
+          title: t('refresh'),
+          'aria-label': t('label'),
+          onMouseLeave: onRowLeave,
+          onClick: refresh,
+        },
+        h('div', { style: fillStyle, 'aria-hidden': true }),
+        view.providers.map((entry) => h(ProviderChip, {
+          key: entry.provider,
+          entry,
+          t,
+          open: openProvider === entry.provider,
+          onOpen: () => { setOpenProvider(entry.provider) },
+          onClose: () => { setOpenProvider((current) => (current === entry.provider ? null : current)) },
+        })),
+        ),
       )
     }
 

@@ -38,7 +38,9 @@ DeepSeekRuntime（DSH）插件：在对话框上方常驻一行，把已配置�
 
 - 徽标用**供应商官方站点的图标**（`opencode.ai`、`commandcode.ai`、`openai.com`、`claude.ai`、`gemini.google.com`、`antigravity.google`），32px PNG 以 data URL 内联，不额外发请求、不受 CSP 影响；没有登记图标的供应商回退成两个字母的首字母徽标。
 - 百分数是**剩余**比例，后面的 `5d 1h` 是它的重置倒计时。剩余 ≤20% 转警示色，≤0 标红。
-- 整行左右内边距跟随输入卡片宽度（`--dsh-composer-card-max-width`），所以徽标左缘与输入框里占位文字的首字对齐。
+- 整行就是目标条那张卡，样式照抄运行中版本（`@deepseek-ai/dsh-client-ui-goal` 的 `.bar`）：圆角 `--dsw-radius-md`（12px）、高 `36px`、内边距 `4px 6px`；**没有 border**，那圈 0.5px 描边和投影都由 `box-shadow: var(--dsw-elevation-panel)` 画出来（描边色取自 `--dsw-elevation-stroke-color: var(--dsw-alias-border-l1)`）；底色是菜单表面 `--dsw-specific-menu`（浅色 `rgba(252,253,254,.7)`），铺在内容下面一层并带 `backdrop-filter: var(--dsw-menu-backdrop-filter)`（`blur(40px) saturate(150%)`）。宽度按同一套算法居中——`min(容器宽度 − 2 × --dsh-composer-side-clearance − 4 × --dsh-composer-dock-inset, --dsh-composer-card-max-width − 4 × --dsh-composer-dock-inset)`，即左右各比输入卡片缩进 16px；徽标自带 6px 内边距，所以第一个徽标距卡边 12px，和目标条图标的位置一致。唯一的差别是高度用 `min-height` 而不是固定值，窄窗口下徽标换行时卡片长高，而不是被裁掉。
+- 卡片底色是必需的，不是装饰：这一行浮在对话流上方，消息正文会从卡片下滚过，没有底色时文字会透过徽标之间的空隙，把百分比和倒计时冲得看不清。
+- 徽标展开（悬停或键盘聚焦）时**不给整块底色**，只在徽标下方画一道底边平直、顶边圆弧的短弧（SVG 曲线），与卡片底边对齐、和供应商信息留开距离；弧线从下方向上移动并渐显，收起时向下渐隐。颜色为较淡的 `--dsw-alias-interactive-bg-hover`，同时把该格文字提亮到 `--dsw-alias-label-primary`。
 - 整行的无障碍名是「余量」；徽标可键盘聚焦，聚焦即展开卡片，鼠标离开整行即收起。
 
 悬停卡片（示例）：
@@ -62,7 +64,7 @@ opencode-go · 套餐 Go
 - 按模型、按模型池分组的窗口直接用名字当标题，例如 Claude 的 `Sonnet` / `Opus` 每周窗口（账号没有对应模型时接口返回 `null`，那一行不出现）、Gemini 的 `Gemini Pro` / `Gemini Flash` / `Gemini Flash Lite`、Antigravity 的 `Gemini 5 小时` / `Claude/GPT 每周`。
 - 卡片底部的「更新于」是该供应商这次数据的读取时刻。
 
-状态文案：读取中显示「读取中…」；整行读取失败显示「读取失败」（点击可重试）；单个供应商读不到时，徽标位置换成「未配置密钥」「需要重新登录」「该账号不可用」之一，鼠标悬停可看原因。
+首次加载、手动刷新或读取重试时，额度条暂时显示「读取中…」提示和旋转指示；手动刷新会请求刷新接口（各供应商仍受自身刷新下限保护）。读取失败时关闭加载提示，显示「读取失败」（点击可重试）。刷新完成后恢复额度内容；单个供应商读不到时，徽标位置换成「未配置密钥」「需要重新登录」「该账号不可用」之一，鼠标悬停可看原因。
 
 ## 数据来源
 
