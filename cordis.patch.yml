@@ -1,0 +1,8 @@
+# Provider quota bar — one persistent row under the composer showing the plan
+# usage of every configured provider (5h / weekly / monthly).
+#
+# The browser half is the whole feature; the host entry exists so the package
+# is a Loader entry and its client bundle is discovered.
+- insert:
+    - id: provider-quota
+      name: '@local/dsh-provider-quota'

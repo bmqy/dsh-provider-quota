@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Provider quota",
+    "description": "A compact row above the composer with the plan usage of every configured provider: the most binding window's remaining share and reset countdown; hover a chip for the full 5-hour / weekly / monthly detail."
+  }
+}

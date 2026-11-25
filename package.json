@@ -1,0 +1,33 @@
+{
+  "name": "@local/dsh-provider-quota",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "在对话输入框下方常驻展示所有已配置模型供应商的套餐余量（5 小时 / 每周 / 每月）。",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
