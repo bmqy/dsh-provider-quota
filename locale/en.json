@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Provider quota",
-    "description": "A compact row above the composer with the plan usage of every configured provider: the most binding window's remaining share and reset countdown; hover a chip for the full 5-hour / weekly / monthly detail."
+    "description": "A compact row above the composer with plan usage (most binding window's remaining share and reset countdown) for opencode-go, command-code, the local Codex, Claude Code and Gemini CLI logins, and Antigravity's local service; hover a chip for every window in detail."
   }
 }
