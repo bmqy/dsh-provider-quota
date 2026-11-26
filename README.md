@@ -20,13 +20,25 @@ DeepSeekRuntime（DSH）插件：在对话框上方常驻一行，把已配置�
 | 供应商 | 余量来自 | 窗口 |
 |---|---|---|
 | `opencode-go` | API Key `OPENCODE_GO_API_KEY` | 5 小时 / 每周 / 每月 |
-| `command-code` | API Key `COMMAND_CODE_API_KEY` | 5 小时 / 每周 / 每月 |
+| `command-code`（注册表 id `commandcode` 也认） | 上游插件在宿主注册的 `commandcodeUsage` 服务；未安装时用 API Key `COMMANDCODE_API_KEY`（旧名 `COMMAND_CODE_API_KEY` 兼容） | 5 小时 / 每周 / 每月 |
 | Codex（本地 CLI） | `~/.codex/auth.json` 里 Codex CLI 自己的 ChatGPT 登录态 | 5 小时 / 每周 |
 | Claude Code（本地 CLI） | `~/.claude/.credentials.json` 里的 OAuth 登录态 | 5 小时 / 每周 / Sonnet、Opus 每周 / 每月 |
 | Gemini CLI（本地 CLI） | `~/.gemini/oauth_creds.json` 里的 OAuth 授权 | 按模型族：Gemini Pro / Flash / Flash Lite |
 | Antigravity（本地服务） | 本机 `language_server` 或 `agy` 进程的 loopback RPC | Gemini 池、Claude/GPT 池，各 5 小时 + 每周 |
 
 自建中转站这类没有可查余量接口的供应商不会出现。
+
+### Command Code：优先读上游插件的共享服务
+
+装了 [Mars-Sea/dsh-commandcode-provider](https://github.com/Mars-Sea/dsh-commandcode-provider) 时，本插件优先读它在宿主注册的 `commandcodeUsage.report()`——和它自己的设置页、`/commandcode` 面板同一个数据源，账号与密钥解析都由它负责，本插件不再重复打账单接口：
+
+- **一个徽标**：多账号时只显示正在服务的那个账号（`active && configured`），没有 active 就取第一个已配置账号；`provider` 仍是 `command-code`，图标也照旧。
+- **窗口只算真能算的**：5 小时 / 每周只在 `cap > 0` 时按 `used / cap` 换算；`cap` 为 0 或没带 cap 是**不限量**，既不当成耗尽、也不画成 0%。月窗只在 `monthlyReported !== false` 且套餐月额度（`plan.monthlyCredits`）大于 0 时，用剩余 `monthlyCredits` 与额度换算。
+- **读不到就说读不到**：选中账号没有额度块、或它的账单端点全部失败时，徽标显示「读取失败」，不会悄悄消失；只有确认是「不限量、本来就没有可算的比例」时才不出徽标。
+- **回退**：没装那个插件、或它的服务没有应答时，回退到本插件自己的直连（`/alpha/billing/credits` + `/alpha/billing/subscriptions`），密钥解析规则见下。
+- **两个 id、两个密钥名**：`commandcode` 与 `command-code` 都认，同时出现也只出一个徽标；密钥先查 `COMMANDCODE_API_KEY`（那个插件存的就是这个），再退回旧名 `COMMAND_CODE_API_KEY`，两个都设时以新名为准。
+
+本插件只认这两个环境变量名，不读那个插件的配置；若你在那边把 `apiKeyEnv` 改成了别的名字，把同一把密钥再以 `COMMANDCODE_API_KEY` 存一次（或在启动环境里导出）即可——装了那个插件时通常用不到：它的服务已经把密钥解析好了。
 
 ## 界面
 
@@ -70,16 +82,18 @@ opencode-go · 套餐 Go
 
 宿主半边注册一条同源 JSON 路由 `GET /provider-quota/state`，浏览器半边只渲染它——密钥、登录 token 和所有对供应商的请求都留在宿主半边。
 
-- **供应商列表**来自运行时 LLM 注册表，取其中有内置适配器的 id；新增、删除供应商会自动反映。`anthropic`、`claude-code`、`gemini-cli`、`google-gemini` 这类 id 归到对应适配器。
+- **供应商列表**来自运行时 LLM 注册表，取其中有内置适配器的 id；新增、删除供应商会自动反映。`commandcode` 归到 `command-code` 适配器，`anthropic`、`claude-code`、`gemini-cli`、`google-gemini` 这类 id 归到对应适配器。
 - **本地 CLI / 本地服务**不在注册表里，单独作为常驻来源：`codex`、`claude`、`gemini` 各读自己的登录文件，并认自己的目录变量（`CODEX_HOME` / `CLAUDE_CONFIG_DIR` / `GEMINI_CLI_HOME`），**登录文件不存在就整条不出现**；`antigravity` 以进程在不在为准，没在跑就不出现。登录、启动之后再轮询一次就自己冒出来。
-- **API Key** 通过凭据 seam 按环境变量名解析，改密钥后下一轮轮询就生效；解析失败时回退到进程环境变量，再失败则显示「未配置密钥」。
+- **Command Code 共享服务**（装了上游插件时）：`commandcodeUsage.report()` 由上游宿主半边提供，本插件只取 `active && configured` 那个账号的 `report.credits` / `report.plan` 换算窗口；服务不存在或抛错才走下面的直连接口。
+- **API Key** 通过凭据 seam 按环境变量名解析，改密钥后下一轮轮询就生效；解析失败时回退到进程环境变量，再失败则显示「未配置密钥」。一个供应商有多个环境变量名时按优先级依次尝试（`command-code`：`COMMANDCODE_API_KEY` → `COMMAND_CODE_API_KEY`）。
 - **用量接口**：
 
 | 供应商 | 接口 | 映射 |
 |---|---|---|
 | `opencode-go` | `GET https://opencode.ai/zen/go/v1/usage` | `usage.rolling` → 5 小时、`weekly`、`monthly`；`percent` 是**已用**比例，`resetsAt` 是 ISO 时间 |
-| `command-code` | `GET https://api.commandcode.ai/alpha/billing/credits` | `windowLimits.fiveHour` / `.weekly` 的 `used` `cap` `resetAt`（epoch 毫秒） |
-| `command-code`（每月） | `GET https://api.commandcode.ai/alpha/billing/subscriptions` | `data.planId` + `data.currentPeriodEnd`，配合套餐月度额度（GOAT=70、Pro=30…）换算月窗 |
+| `command-code`（共享服务） | 上游插件注册的 `commandcodeUsage.report()`（`ctx.inject(['commandcodeUsage'])`） | `accounts[].report`：取 `active && configured` 账号；`credits.fiveHour` / `.weekly` 的 `used` / `cap` / `resetAt`（epoch 毫秒）→ 5 小时 / 每周，**只在 `cap > 0` 时**换算；`credits.monthlyCredits` 与 `plan.monthlyCredits` → 每月（`monthlyReported === false` 时不出月窗） |
+| `command-code`（回退直连） | `GET https://api.commandcode.ai/alpha/billing/credits` | `windowLimits.fiveHour` / `.weekly` 的 `used` `cap` `resetAt`（epoch 毫秒） |
+| `command-code`（回退直连 · 每月） | `GET https://api.commandcode.ai/alpha/billing/subscriptions` | `data.planId` + `data.currentPeriodEnd`，配合套餐月度额度（GOAT=70、Pro=30…）换算月窗 |
 | `codex`（本地 CLI） | `GET https://chatgpt.com/backend-api/codex/usage` | `plan_type`（PLUS / PRO…）+ `rate_limit.primary_window` → 5 小时、`secondary_window` → 每周；`used_percent`、`reset_at`（秒） |
 | `claude`（本地 CLI） | `GET https://api.anthropic.com/api/oauth/usage` | `five_hour` → 5 小时、`seven_day` → 每周、`seven_day_sonnet` / `seven_day_opus` → 按模型的每周窗口、`extra_usage` → 每月；`utilization` 是**已用**比例，`resets_at` 是 ISO 时间 |
 | `gemini`（本地 CLI） | `POST …/v1internal:loadCodeAssist` + `POST …/v1internal:retrieveUserQuota` | `loadCodeAssist` 给套餐和 `cloudaicompanionProject`（查询必须带 project，拿不到时退回 Cloud Resource Manager 里 `gen-lang-client*` 或带 `generative-language` 标签的项目）；`buckets[]` 的 `modelId` 归到 Pro / Flash / Flash Lite 三组，`remainingFraction` 换算成已用，`resetTime` 是 ISO 时间 |
@@ -106,8 +120,8 @@ Claude、Gemini、Antigravity 三条的接口形状照公开项目的做法实�
 
 ## 刷新与缓存
 
-- 默认 60 秒轮询一次。宿主侧另有缓存，多个标签页不会重复打供应商接口：默认 45 秒，Claude 5 分钟（`api/oauth/usage` 限流较紧），Gemini 2 分钟，Antigravity 45 秒。
-- 点击这一行 → 立即重读，但受刷新下限约束：Claude / Gemini 最快 60 秒一次，Antigravity 30 秒，其余无下限。
+- 默认 60 秒轮询一次。宿主侧另有缓存，多个标签页不会重复打供应商接口：默认 45 秒，Claude 5 分钟（`api/oauth/usage` 限流较紧），Gemini 2 分钟，Antigravity 45 秒；Command Code 走上游共享服务时也只保留一次 `report()` 的结果 45 秒。
+- 点击这一行 → 立即重读，但受刷新下限约束：Claude / Gemini 最快 60 秒一次，Antigravity 30 秒，Command Code 共享服务 30 秒，其余无下限。
 - 读取失败时保留上一次数字；从未成功过则显示「读取失败」。
 - 徽标是否出现只看「登录文件在不在」或「Antigravity 进程在不在」（判断结果缓存 2 分钟；Antigravity 的进程扫描在找到时缓存 30 秒、没找到时 5 分钟），所以登录、登出、启动、退出之后最多一轮就能反映，空闲时基本不产生开销。
 

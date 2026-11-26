@@ -79,11 +79,39 @@ const COMMAND_CODE_MONTHLY_CREDITS = {
   'teams-pro': 40,
 }
 
-/** Providers with an adapter here, and the env var holding their API key. */
+/**
+ * Providers with an adapter here, and the env vars that may hold their API key,
+ * most preferred first.
+ *
+ * Mars-Sea/dsh-commandcode-provider registers the provider id `commandcode` and
+ * defaults its credential reference to `COMMANDCODE_API_KEY`, so that name is
+ * tried first; `COMMAND_CODE_API_KEY` stays as the legacy name for installs made
+ * before that plugin existed.
+ */
 const API_KEY_ENV = {
-  'opencode-go': 'OPENCODE_GO_API_KEY',
-  'command-code': 'COMMAND_CODE_API_KEY',
+  'opencode-go': ['OPENCODE_GO_API_KEY'],
+  'command-code': ['COMMANDCODE_API_KEY', 'COMMAND_CODE_API_KEY'],
 }
+
+/**
+ * The upstream Command Code plugin (`Mars-Sea/dsh-commandcode-provider`)
+ * registers `commandcodeUsage.report()` on the host. It already holds every
+ * configured account, resolves the keys itself and answers the plan, credit
+ * balances and the 5-hour / weekly windows, so it is the preferred source: it
+ * is the same service that provider's own settings page reads.
+ *
+ * The optional service is picked up through `ctx.inject` (a profile without
+ * that plugin simply never fires it), and the raw billing calls below stay as
+ * the fallback for installs that only registered the LLM provider.
+ */
+const COMMAND_CODE_USAGE_CACHE_KEY = 'command-code#usage-service'
+const COMMAND_CODE_USAGE_TTL_MS = 45_000
+const COMMAND_CODE_USAGE_REFRESH_FLOOR_MS = 30_000
+
+/** Set by `apply` when the upstream service is present; never by tests. */
+let commandCodeUsage
+/** Number of live `apply` fibers currently holding that service. */
+let commandCodeUsageRefs = 0
 
 /** Providers that are not part of the LLM registry but still have quota. */
 const LOCAL_PROVIDERS = ['codex', 'claude', 'gemini', 'antigravity']
@@ -94,6 +122,9 @@ const PROVIDER_ALIASES = {
   'claude-code': 'claude',
   'gemini-cli': 'gemini',
   'google-gemini': 'gemini',
+  // Mars-Sea/dsh-commandcode-provider registers this id for the same service
+  // the canonical `command-code` adapter already speaks to.
+  commandcode: 'command-code',
 }
 
 /** Display names for routes whose registry id is not self-explanatory. */
@@ -321,6 +352,176 @@ async function queryCommandCode({ apiKey }) {
 
   const planTier = planId === undefined ? undefined : String(planId).replace(/^individual-/, '').toUpperCase()
   return { windows, planTier }
+}
+
+// ---------------------------------------------------------------------------
+// Command Code through the upstream `commandcodeUsage` service
+//
+// `report()` answers `{ accounts: [{ id, label, configured, active, mark,
+// cooldownUntil, report }] }`, where each inner report is the plugin's own
+// normalized billing answer:
+//
+//   { failures, blocked, credits: { monthlyCredits, monthlyReported, fiveHour,
+//     weekly, ... }, plan: { planId, name, monthlyCredits, currentPeriodEnd } }
+//
+// The bar shows ONE chip — the account that is currently serving requests — so
+// a multi-account install still gets the vendor's mark and route key
+// `command-code`, and the card describes that account alone.
+//
+// The report's strict meanings are load-bearing, and none of them is zero:
+//   - an ABSENT `credits.fiveHour` / `.weekly` means the endpoint reported no
+//     such window (an unlimited plan), not an exhausted one;
+//   - `cap: 0` (or a missing cap) is uncapped spend, so it can never be drawn
+//     as a fraction of a cap and is never "exhausted";
+//   - `credits.monthlyReported === false` means the balance was omitted, which
+//     cannot be told from a real zero, so no monthly window is drawn.
+// ---------------------------------------------------------------------------
+
+/** Plan tier from the report's plan, using the same rule as the raw adapter. */
+function commandCodeReportTier(report) {
+  const planId = report?.plan?.planId
+  if (typeof planId === 'string' && planId !== '') return planId.replace(/^individual-/, '').toUpperCase()
+  const name = typeof report?.plan?.name === 'string' ? report.plan.name.trim() : ''
+  return name === '' ? undefined : name
+}
+
+/** The 5-hour / weekly / monthly windows one account report really measured. */
+function commandCodeReportWindows(report) {
+  const credits = report?.credits
+  if (credits === null || typeof credits !== 'object') return []
+
+  const windows = []
+  for (const [field, tier] of [['fiveHour', 'five_hour'], ['weekly', 'weekly']]) {
+    const limit = credits[field]
+    // Absent, or a cap that is not a positive number, is not a quota: neither
+    // can become a percentage, and neither may read as exhausted.
+    if (limit === null || typeof limit !== 'object') continue
+    const cap = toFinite(limit.cap)
+    if (cap === undefined || cap <= 0) continue
+    const used = toFinite(limit.used)
+    const usedPercent = used === undefined ? undefined : (used / cap) * 100
+    windows.push(percentWindow(tier, usedPercent, toFinite(limit.resetAt)))
+  }
+
+  // The monthly window needs both figures: the plan's allowance and the balance
+  // the endpoint really reported (`monthlyReported !== false`).
+  const allowance = toFinite(report?.plan?.monthlyCredits)
+  const remaining = toFinite(credits.monthlyCredits)
+  if (credits.monthlyReported !== false && allowance !== undefined && allowance > 0 && remaining !== undefined) {
+    windows.push(percentWindow(
+      'monthly',
+      ((allowance - remaining) / allowance) * 100,
+      toFinite(report?.plan?.currentPeriodEnd),
+    ))
+  }
+
+  return windows
+}
+
+/** The account the bar reports on: the serving one, else the first configured. */
+function commandCodeSelectedAccount(accounts) {
+  const configured = accounts.filter((account) => (
+    account !== null && typeof account === 'object' && account.configured !== false
+  ))
+  return configured.find((account) => account.active === true) ?? configured[0]
+}
+
+/** The single bar entry for the selected account; `undefined` when it has nothing to show. */
+function commandCodeEntry(account) {
+  const report = account.report !== null && typeof account.report === 'object' ? account.report : {}
+
+  if (report.blocked === 'invalid-key') {
+    return { status: 'error', provider: 'command-code', providerName: 'command-code', error: { kind: 'auth' } }
+  }
+  if (report.blocked !== undefined) {
+    return {
+      status: 'error',
+      provider: 'command-code',
+      providerName: 'command-code',
+      error: { kind: 'http', message: String(report.blocked) },
+    }
+  }
+
+  const windows = commandCodeReportWindows(report)
+  if (windows.length === 0) {
+    const failures = Array.isArray(report.failures)
+      ? report.failures.filter((failure) => typeof failure === 'string' && failure !== '')
+      : []
+    const credits = report.credits
+    const measured = credits !== null && typeof credits === 'object'
+    // No credit block at all, or every endpoint failed: the account is usable
+    // but its quota is temporarily unreadable, which the user should see rather
+    // than a silently missing chip.
+    if (!measured || failures.length > 0) {
+      return {
+        status: 'error',
+        provider: 'command-code',
+        providerName: 'command-code',
+        fetchedAt: Date.now(),
+        error: { kind: 'http', message: failures.length > 0 ? failures.join('; ') : 'no credit report' },
+      }
+    }
+    // Measured credit block with no caps to divide by: a genuinely unlimited
+    // plan has no percentage to show, so the chip stays away instead of
+    // reporting a false zero.
+    return undefined
+  }
+
+  return {
+    status: 'ok',
+    provider: 'command-code',
+    providerName: 'command-code',
+    planTier: commandCodeReportTier(report),
+    fetchedAt: Date.now(),
+    windows,
+  }
+}
+
+/**
+ * One report call for the serving account, cached like the raw adapters.
+ *
+ * `undefined` means the service could not answer (not installed, or it threw),
+ * which is the only case that falls back to the raw billing endpoints. An empty
+ * array means the service answered and this account has no measurable window
+ * (every limit uncapped): the bar then shows no chip rather than a false zero.
+ */
+async function queryCommandCodeUsage(options) {
+  const service = commandCodeUsage
+  if (service === undefined || typeof service.report !== 'function') return undefined
+
+  const cached = cache.get(COMMAND_CODE_USAGE_CACHE_KEY)
+  if (cached !== undefined) {
+    const age = Date.now() - cached.at
+    const limit = options.refresh === true ? COMMAND_CODE_USAGE_REFRESH_FLOOR_MS : COMMAND_CODE_USAGE_TTL_MS
+    if (age < limit) return cached.payload
+  }
+  const running = inflight.get(COMMAND_CODE_USAGE_CACHE_KEY)
+  if (running !== undefined) return running
+
+  const query = (async () => {
+    try {
+      const answer = await service.report()
+      const accounts = Array.isArray(answer?.accounts) ? answer.accounts : []
+      const account = commandCodeSelectedAccount(accounts)
+      // Nothing configured: let the raw adapter report "no API key", which is
+      // the actionable message here.
+      if (account === undefined) return undefined
+      const entry = commandCodeEntry(account)
+      const payload = entry === undefined ? [] : [entry]
+      cache.set(COMMAND_CODE_USAGE_CACHE_KEY, { at: Date.now(), payload })
+      return payload
+    } catch {
+      // A missing key or a broken service falls back to the raw adapter.
+      return undefined
+    }
+  })()
+
+  inflight.set(COMMAND_CODE_USAGE_CACHE_KEY, query)
+  try {
+    return await query
+  } finally {
+    inflight.delete(COMMAND_CODE_USAGE_CACHE_KEY)
+  }
 }
 
 /** Local Codex CLI: ChatGPT plan windows from its own login. */
@@ -1190,18 +1391,23 @@ const ADAPTERS = {
 
 /** Resolve a provider's API key through the credential seam. */
 async function readApiKey(ctx, provider) {
-  const envName = API_KEY_ENV[provider]
-  if (envName === undefined) return undefined
-  try {
-    const resolved = await ctx.credentials.resolve(envName)
-    if (resolved !== null && typeof resolved === 'object' && typeof resolved.value === 'string' && resolved.value !== '') {
-      return resolved.value
+  const envNames = API_KEY_ENV[provider]
+  if (envNames === undefined) return undefined
+  // Names in order; within one name the credential seam is asked before the
+  // process environment, so a key saved in Settings beats a stray shell value.
+  for (const envName of envNames) {
+    try {
+      const resolved = await ctx.credentials.resolve(envName)
+      if (resolved !== null && typeof resolved === 'object' && typeof resolved.value === 'string' && resolved.value !== '') {
+        return resolved.value
+      }
+    } catch {
+      // A credential seam failure falls through to the process environment.
     }
-  } catch {
-    // A credential seam failure falls through to the process environment.
+    const ambient = process.env[envName]
+    if (typeof ambient === 'string' && ambient !== '') return ambient
   }
-  const ambient = process.env[envName]
-  return typeof ambient === 'string' && ambient !== '' ? ambient : undefined
+  return undefined
 }
 
 /** Whether a CLI-login provider is actually usable on this machine. */
@@ -1311,14 +1517,37 @@ async function snapshot(ctx, options) {
     eligible.push(provider)
   }
 
-  const results = await Promise.all(eligible.map((provider) => queryProvider(ctx, provider, options)))
+  const results = await Promise.all(eligible.map(async (provider) => {
+    if (provider === 'command-code') {
+      const entries = await queryCommandCodeUsage(options)
+      // The shared service answered (even with no chip to draw): never ask the
+      // billing endpoints behind its back.
+      if (entries !== undefined) return entries
+    }
+    return [await queryProvider(ctx, provider, options)]
+  }))
+
   return {
     intervalSec: DEFAULT_INTERVAL_SEC,
-    providers: results.filter((entry) => entry !== undefined),
+    providers: results.flat().filter((entry) => entry !== undefined),
   }
 }
 
 export function apply(ctx) {
+  // Optional: the upstream Command Code plugin's own multi-account report. A
+  // profile without that plugin never enters this fiber.
+  ctx.inject(['commandcodeUsage'], (scope) => {
+    // Refcounted so a reload / repeated apply cannot clear a service another
+    // live fiber still holds; the last disposer (upstream unloaded) drops it
+    // and the next snapshot falls back to the raw billing endpoints.
+    commandCodeUsage = scope.commandcodeUsage
+    commandCodeUsageRefs += 1
+    scope.effect(() => () => {
+      commandCodeUsageRefs = Math.max(0, commandCodeUsageRefs - 1)
+      if (commandCodeUsageRefs === 0) commandCodeUsage = undefined
+    }, 'provider-quota: commandcode usage')
+  })
+
   ctx.inject(['webServer'], (scope) => {
     scope.effect(() => scope.webServer.register({
       kind: 'exact',

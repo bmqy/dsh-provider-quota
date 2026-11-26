@@ -1,4 +1,4 @@
-﻿// Host-half tests: the state route against synthetic provider responses.
+// Host-half tests: the state route against synthetic provider responses.
 //
 // Every case re-imports `index.js` so its per-provider cache starts empty, and
 // points the CLI-login adapters at throwaway `CLAUDE_CONFIG_DIR` /
@@ -30,6 +30,7 @@ beforeEach(async () => {
     USERPROFILE: process.env.USERPROFILE,
     HOME: process.env.HOME,
     OPENCODE_GO_API_KEY: process.env.OPENCODE_GO_API_KEY,
+    COMMANDCODE_API_KEY: process.env.COMMANDCODE_API_KEY,
     COMMAND_CODE_API_KEY: process.env.COMMAND_CODE_API_KEY,
   }
   process.env.USERPROFILE = join(root, 'home')
@@ -39,6 +40,7 @@ beforeEach(async () => {
   delete process.env.GEMINI_CLI_HOME
   delete process.env.CODEX_HOME
   delete process.env.OPENCODE_GO_API_KEY
+  delete process.env.COMMANDCODE_API_KEY
   delete process.env.COMMAND_CODE_API_KEY
   await mkdir(join(root, 'home'), { recursive: true })
 })
@@ -92,6 +94,18 @@ async function startPlugin(options = {}) {
     credentials: { resolve: options.resolve ?? (async () => undefined) },
     llm: { listProviders: () => options.providers ?? [] },
     inject(names, callback) {
+      // The upstream Command Code plugin is optional: without it the plugin
+      // simply never enters that fiber, exactly like cordis.
+      if (names.length === 1 && names[0] === 'commandcodeUsage') {
+        if (options.commandCodeUsage === undefined) return
+        callback({
+          commandcodeUsage: options.commandCodeUsage,
+          effect(fn) {
+            return fn()
+          },
+        })
+        return
+      }
       assert.deepEqual(names, ['webServer'])
       callback({
         effect(fn) {
@@ -378,6 +392,395 @@ test('registry: API-key providers keep working, and a missing key shows up as su
   const commandCode = entryOf(payload, 'command-code')
   assert.equal(commandCode.status, 'error')
   assert.equal(commandCode.error.kind, 'no-credential')
+})
+
+/** Command Code: credits carry the 5-hour and weekly windows, the plan the month. */
+const COMMAND_CODE_CREDITS = {
+  windowLimits: {
+    fiveHour: { used: 120, cap: 400, resetAt: 1_795_603_200_000 },
+    weekly: { used: 45, cap: 100, resetAt: 1_796_103_498_000 },
+  },
+  credits: { monthlyCredits: 55 },
+}
+
+const COMMAND_CODE_SUBSCRIPTION = {
+  data: { planId: 'individual-goat', currentPeriodEnd: '2026-12-01T00:00:00Z' },
+}
+
+function stubCommandCode() {
+  return stubFetch((url) => {
+    if (url === 'https://api.commandcode.ai/alpha/billing/credits') return response(200, COMMAND_CODE_CREDITS)
+    if (url === 'https://api.commandcode.ai/alpha/billing/subscriptions') return response(200, COMMAND_CODE_SUBSCRIPTION)
+    return undefined
+  })
+}
+
+test('commandcode: the upstream registry id yields one command-code chip with every window', async () => {
+  const calls = stubCommandCode()
+  const asked = []
+
+  // Mars-Sea/dsh-commandcode-provider registers `commandcode` and saves the key
+  // under COMMANDCODE_API_KEY; a legacy install may still list `command-code`.
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }, { id: 'command-code' }],
+    resolve: async (envName) => {
+      asked.push(envName)
+      return envName === 'COMMANDCODE_API_KEY' ? { value: 'cc-key' } : undefined
+    },
+  })
+  const payload = await state()
+
+  assert.deepEqual(payload.providers.map((entry) => entry.provider), ['command-code'])
+  const entry = payload.providers[0]
+  assert.equal(entry.status, 'ok')
+  assert.equal(entry.planTier, 'GOAT')
+  // used / cap, not percent: 120/400 and 45/100.
+  assert.equal(windowOf(entry, 'five_hour').usedPercent, 30)
+  assert.equal(windowOf(entry, 'five_hour').resetAt, 1_795_603_200_000)
+  assert.equal(windowOf(entry, 'weekly').usedPercent, 45)
+  assert.equal(windowOf(entry, 'weekly').resetAt, 1_796_103_498_000)
+  // 55 of GOAT's 70 monthly credits left → 21.4% used, reset from the period end.
+  assert.equal(Math.round(windowOf(entry, 'monthly').usedPercent), 21)
+  assert.equal(windowOf(entry, 'monthly').resetAt, Date.parse('2026-12-01T00:00:00.000Z'))
+
+  // The key saved by the upstream plugin is the one sent, and only two requests go out.
+  assert.equal(asked[0], 'COMMANDCODE_API_KEY')
+  assert.deepEqual(calls.map((call) => call.url), [
+    'https://api.commandcode.ai/alpha/billing/credits',
+    'https://api.commandcode.ai/alpha/billing/subscriptions',
+  ])
+  assert.deepEqual(calls.map((call) => call.init.headers.authorization), ['Bearer cc-key', 'Bearer cc-key'])
+})
+
+test('commandcode: the legacy COMMAND_CODE_API_KEY still authenticates', async () => {
+  process.env.COMMAND_CODE_API_KEY = 'legacy-key'
+  const calls = stubCommandCode()
+
+  const state = await startPlugin({ providers: [{ id: 'commandcode' }] })
+  const entry = entryOf(await state(), 'command-code')
+
+  assert.equal(entry.status, 'ok')
+  assert.equal(windowOf(entry, 'five_hour').usedPercent, 30)
+  assert.ok(calls.every((call) => call.init.headers.authorization === 'Bearer legacy-key'))
+})
+
+test('commandcode: the legacy COMMAND_CODE_API_KEY is still read through the credential seam', async () => {
+  const calls = stubCommandCode()
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    resolve: async (envName) => (envName === 'COMMAND_CODE_API_KEY' ? { value: 'legacy-seam-key' } : undefined),
+  })
+  const entry = entryOf(await state(), 'command-code')
+
+  assert.equal(entry.status, 'ok')
+  assert.ok(calls.every((call) => call.init.headers.authorization === 'Bearer legacy-seam-key'))
+})
+
+test('commandcode: COMMANDCODE_API_KEY is preferred when both names are set', async () => {
+  process.env.COMMANDCODE_API_KEY = 'upstream-key'
+  process.env.COMMAND_CODE_API_KEY = 'legacy-key'
+  const calls = stubCommandCode()
+
+  const state = await startPlugin({ providers: [{ id: 'commandcode' }] })
+  const entry = entryOf(await state(), 'command-code')
+
+  assert.equal(entry.status, 'ok')
+  assert.ok(calls.every((call) => call.init.headers.authorization === 'Bearer upstream-key'))
+})
+
+// ---------------------------------------------------------------------------
+// Command Code through the upstream plugin's `commandcodeUsage.report()`
+// service (Mars-Sea/dsh-commandcode-provider): the preferred source.
+// ---------------------------------------------------------------------------
+
+/** A stand-in for the upstream service; `report()` is the only method used. */
+function commandCodeUsageService(accounts) {
+  const calls = []
+  return {
+    calls,
+    service: {
+      async report() {
+        calls.push(Date.now())
+        return { accounts }
+      },
+    },
+  }
+}
+
+/** One account as the upstream report shapes it (`CommandCodeAccountUsage`). */
+function commandCodeAccount(overrides = {}) {
+  return {
+    id: 'default',
+    label: 'Default',
+    configured: true,
+    active: true,
+    mark: '',
+    cooldownUntil: 0,
+    report: {
+      failures: [],
+      credits: {
+        monthlyCredits: 55,
+        purchasedCredits: 0,
+        freeCredits: 0,
+        fiveHour: { used: 120, cap: 400, exceeded: false, resetAt: 1_795_603_200_000 },
+        weekly: { used: 45, cap: 100, exceeded: false, resetAt: 1_796_103_498_000 },
+      },
+      plan: {
+        planId: 'individual-goat',
+        name: 'GOAT',
+        status: 'active',
+        monthlyCredits: 70,
+        currentPeriodEnd: Date.parse('2026-12-01T00:00:00Z'),
+      },
+    },
+    ...overrides,
+  }
+}
+
+test('commandcode: the upstream report service feeds the bar with no billing call', async () => {
+  const calls = stubFetch(() => undefined)
+  const usage = commandCodeUsageService([commandCodeAccount()])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const payload = await state()
+
+  assert.deepEqual(payload.providers.map((entry) => entry.provider), ['command-code'])
+  const entry = payload.providers[0]
+  assert.equal(entry.status, 'ok')
+  assert.equal(entry.providerName, 'command-code')
+  assert.equal(entry.planTier, 'GOAT')
+  assert.equal(windowOf(entry, 'five_hour').usedPercent, 30)
+  assert.equal(windowOf(entry, 'five_hour').resetAt, 1_795_603_200_000)
+  assert.equal(windowOf(entry, 'weekly').usedPercent, 45)
+  assert.equal(Math.round(windowOf(entry, 'monthly').usedPercent), 21)
+  assert.equal(windowOf(entry, 'monthly').resetAt, Date.parse('2026-12-01T00:00:00Z'))
+
+  // The service is the source: no credential lookup, no billing endpoint.
+  assert.equal(calls.length, 0)
+  assert.equal(usage.calls.length, 1)
+})
+
+test('commandcode: the serving account is the one chip, even with several accounts', async () => {
+  const idle = commandCodeAccount({
+    id: 'account-2',
+    label: 'Go #2',
+    active: false,
+    report: {
+      failures: [],
+      credits: {
+        monthlyCredits: 0,
+        purchasedCredits: 0,
+        freeCredits: 0,
+        fiveHour: { used: 400, cap: 400, exceeded: true, resetAt: 1_795_603_200_000 },
+        weekly: { used: 10, cap: 100, exceeded: false, resetAt: 1_796_103_498_000 },
+      },
+      plan: {
+        planId: 'individual-go',
+        name: 'Go',
+        status: 'active',
+        monthlyCredits: 10,
+        currentPeriodEnd: Date.parse('2026-12-01T00:00:00Z'),
+      },
+    },
+  })
+  const usage = commandCodeUsageService([idle, commandCodeAccount()])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const payload = await state()
+
+  // One chip, the vendor's own mark and route key, built from the ACTIVE
+  // account — not from the exhausted idle one.
+  assert.deepEqual(payload.providers.map((entry) => [entry.provider, entry.providerName]), [
+    ['command-code', 'command-code'],
+  ])
+  const entry = payload.providers[0]
+  assert.equal(entry.status, 'ok')
+  assert.equal(entry.planTier, 'GOAT')
+  assert.equal(windowOf(entry, 'five_hour').usedPercent, 30)
+  assert.equal(windowOf(entry, 'weekly').usedPercent, 45)
+  assert.equal(Math.round(windowOf(entry, 'monthly').usedPercent), 21)
+})
+
+test('commandcode: without an active account the first configured one is used', async () => {
+  const usage = commandCodeUsageService([
+    commandCodeAccount({ id: 'account-2', active: false, configured: false, report: { failures: ['credits'] } }),
+    commandCodeAccount({ id: 'account-3', label: 'Backup', active: false }),
+  ])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const payload = await state()
+
+  assert.deepEqual(payload.providers.map((entry) => entry.provider), ['command-code'])
+  assert.equal(payload.providers[0].status, 'ok')
+  assert.equal(windowOf(payload.providers[0], 'five_hour').usedPercent, 30)
+})
+
+test('commandcode: uncapped and unreported limits are never drawn as zeros or exhaustion', async () => {
+  const usage = commandCodeUsageService([commandCodeAccount({
+    report: {
+      failures: [],
+      credits: {
+        // `fiveHour` is absent, `weekly.cap === 0` is uncapped spend, and
+        // `monthlyReported === false` means the balance was omitted.
+        monthlyCredits: 0,
+        monthlyReported: false,
+        purchasedCredits: 0,
+        freeCredits: 0,
+        weekly: { used: 7, cap: 0, exceeded: false, resetAt: 1_796_103_498_000 },
+      },
+      plan: {
+        planId: 'individual-go',
+        name: 'Go',
+        status: 'active',
+        monthlyCredits: 10,
+        currentPeriodEnd: Date.parse('2026-12-01T00:00:00Z'),
+      },
+    },
+  })])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const payload = await state()
+
+  // Nothing measurable: no chip at all, rather than a 0% (exhausted) one, and
+  // no fallback request to the billing endpoints either.
+  assert.deepEqual(payload.providers, [])
+})
+
+test('commandcode: an uncapped window leaves the reported monthly window to carry the chip', async () => {
+  const usage = commandCodeUsageService([commandCodeAccount({
+    report: {
+      failures: [],
+      credits: {
+        monthlyCredits: 20,
+        purchasedCredits: 0,
+        freeCredits: 0,
+        fiveHour: { used: 900, cap: 0, exceeded: false, resetAt: 1_795_603_200_000 },
+        weekly: { used: 50, cap: 0, exceeded: false, resetAt: 1_796_103_498_000 },
+      },
+      plan: {
+        planId: 'individual-goat',
+        name: 'GOAT',
+        status: 'active',
+        monthlyCredits: 70,
+        currentPeriodEnd: Date.parse('2026-12-01T00:00:00Z'),
+      },
+    },
+  })])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const entry = entryOf(await state(), 'command-code')
+
+  assert.equal(entry.status, 'ok')
+  assert.deepEqual(entry.windows.map((window) => window.tier), ['monthly'])
+  // 20 of GOAT's 70 credits left: 71% used, so 29% left — not exhausted.
+  assert.equal(Math.round(windowOf(entry, 'monthly').usedPercent), 71)
+})
+
+test('commandcode: a selected account with no credit report shows as unreadable, not missing', async () => {
+  const calls = stubFetch(() => undefined)
+  const usage = commandCodeUsageService([commandCodeAccount({ report: { failures: [] } })])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const entry = entryOf(await state(), 'command-code')
+
+  // The service answered and the account is configured, but no quota could be
+  // read: a visible failure chip, and no billing fallback request.
+  assert.equal(entry.status, 'error')
+  assert.equal(entry.error.kind, 'http')
+  assert.equal(calls.length, 0)
+})
+
+test('commandcode: when every report endpoint failed the chip names the failure', async () => {
+  const usage = commandCodeUsageService([commandCodeAccount({
+    report: { failures: ['credits', 'subscriptions'] },
+  })])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const entry = entryOf(await state(), 'command-code')
+
+  assert.equal(entry.status, 'error')
+  assert.equal(entry.error.kind, 'http')
+  assert.match(entry.error.message, /credits/)
+})
+
+test('commandcode: a rejected key in the report reads as "sign-in required"', async () => {
+  const usage = commandCodeUsageService([commandCodeAccount({
+    report: { failures: ['credits'], blocked: 'invalid-key' },
+  })])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const entry = entryOf(await state(), 'command-code')
+
+  assert.equal(entry.status, 'error')
+  assert.equal(entry.error.kind, 'auth')
+})
+
+test('commandcode: an active but unconfigured slot is skipped, never drawn as an error', async () => {
+  const unconfigured = commandCodeAccount({
+    id: 'account-2',
+    label: 'Spare',
+    configured: false,
+    active: true,
+    report: { failures: ['credits'], blocked: 'invalid-key' },
+  })
+  const usage = commandCodeUsageService([unconfigured, commandCodeAccount()])
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: usage.service,
+  })
+  const payload = await state()
+
+  // The unusable slot would answer `invalid-key`; it is skipped, and the one
+  // configured account supplies the chip with its own plan and windows.
+  assert.deepEqual(payload.providers.map((entry) => entry.provider), ['command-code'])
+  assert.equal(payload.providers[0].status, 'ok')
+  assert.equal(payload.providers[0].planTier, 'GOAT')
+  assert.equal(windowOf(payload.providers[0], 'five_hour').usedPercent, 30)
+})
+
+test('commandcode: a broken report service falls back to the billing endpoints', async () => {
+  const calls = stubCommandCode()
+
+  const state = await startPlugin({
+    providers: [{ id: 'commandcode' }],
+    commandCodeUsage: {
+      async report() {
+        throw new Error('MISSING_CREDENTIAL')
+      },
+    },
+    resolve: async (envName) => (envName === 'COMMANDCODE_API_KEY' ? { value: 'cc-key' } : undefined),
+  })
+  const entry = entryOf(await state(), 'command-code')
+
+  assert.equal(entry.status, 'ok')
+  assert.equal(windowOf(entry, 'five_hour').usedPercent, 30)
+  assert.equal(calls.length, 2)
 })
 
 test('registry: vendor aliases resolve to one chip per provider', async () => {

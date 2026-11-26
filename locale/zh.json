@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "供应商余量",
-    "description": "在输入框上方常驻一行，紧凑显示供应商套餐余量（最吃紧窗口的剩余比例与重置倒计时），包括 opencode-go / command-code 以及本地 Codex、Claude Code、Gemini CLI、Antigravity 的登录态；鼠标悬停展开各窗口的完整明细。"
+    "description": "在输入框上方常驻一行，紧凑显示供应商套餐余量（最吃紧窗口的剩余比例与重置倒计时），包括 opencode-go / command-code（注册表 id `commandcode` 也认，装了上游 Command Code 插件时直接读它的共享用量服务）以及本地 Codex、Claude Code、Gemini CLI、Antigravity 的登录态；鼠标悬停展开各窗口的完整明细。"
   }
 }
