@@ -24,6 +24,8 @@ window.__ModuleLoader__.load({
     const NS = 'provider-quota'
     const STATE_PATH = '/provider-quota/state'
     const MIN_POLL_MS = 30_000
+    const PROVIDER_VISIBILITY_KEY = 'dsh-provider-quota:provider-visibility'
+    const LEGACY_LOCAL_VISIBILITY_KEY = 'dsh-provider-quota:local-provider-visibility'
 
     const copy = {
       zh: {
@@ -54,6 +56,11 @@ window.__ModuleLoader__.load({
         plan: '套餐 {tier}',
         fetched: '更新于 {time}',
         noWindows: '没有可显示的窗口',
+        providerDisplay: '显示设置',
+        providerQuotaTitle: '供应商余量显示',
+        providerQuotaHint: '仅控制余量条显示，不影响检测和刷新',
+        manageProviderDisplay: '管理供应商余量显示',
+        showProviderQuota: '显示 {provider} 余量',
       },
       en: {
         label: 'Quota',
@@ -83,6 +90,11 @@ window.__ModuleLoader__.load({
         plan: 'Plan {tier}',
         fetched: 'fetched {time}',
         noWindows: 'no windows to show',
+        providerDisplay: 'Display settings',
+        providerQuotaTitle: 'Provider quota display',
+        providerQuotaHint: 'Controls display only; detection and refresh are unchanged.',
+        manageProviderDisplay: 'Manage provider quota display',
+        showProviderQuota: 'Show {provider} quota',
       },
     }
 
@@ -254,6 +266,114 @@ window.__ModuleLoader__.load({
       fontSize: '12.5px',
       margin: '0 0 6px',
     }
+    const providerSettingsPanelStyle = {
+      position: 'absolute',
+      right: 0,
+      bottom: '100%',
+      zIndex: 41,
+      boxSizing: 'border-box',
+      width: '256px',
+      maxWidth: 'calc(100vw - 48px)',
+      maxHeight: 'min(70vh, 480px)',
+      overflowY: 'auto',
+      padding: '12px',
+      borderRadius: '10px',
+      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
+      background: 'var(--dsw-alias-bg-layer-1, #fff)',
+      color: 'var(--dsw-alias-label-secondary)',
+      fontSize: '12px',
+      lineHeight: '18px',
+      cursor: 'default',
+      userSelect: 'text',
+    }
+    const providerSettingsButtonStyle = {
+      position: 'relative',
+      zIndex: 1,
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '5px',
+      marginLeft: 'auto',
+      padding: '4px 7px',
+      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
+      borderRadius: '999px',
+      background: 'transparent',
+      color: 'var(--dsw-alias-label-secondary)',
+      font: 'inherit',
+      lineHeight: '16px',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+    }
+    const refreshButtonStyle = {
+      position: 'relative',
+      zIndex: 1,
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      flex: '0 0 auto',
+      width: '28px',
+      height: '28px',
+      padding: 0,
+      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
+      borderRadius: '999px',
+      background: 'transparent',
+      color: 'var(--dsw-alias-label-secondary)',
+      cursor: 'pointer',
+    }
+    const providerSettingsHintStyle = {
+      margin: '0 0 8px',
+      color: 'var(--dsw-alias-label-secondary)',
+      fontSize: '11px',
+      lineHeight: '15px',
+    }
+    const providerSettingRowStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      minHeight: '30px',
+    }
+    const providerSettingNameStyle = {
+      flex: '1 1 auto',
+      minWidth: 0,
+      overflowWrap: 'anywhere',
+      color: 'var(--dsw-alias-label-primary)',
+    }
+    const providerSwitchButtonStyle = {
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      flex: '0 0 auto',
+      width: '44px',
+      height: '28px',
+      padding: 0,
+      border: 0,
+      borderRadius: '999px',
+      background: 'transparent',
+      color: 'inherit',
+      cursor: 'pointer',
+    }
+    const providerSwitchTrackStyle = (enabled) => ({
+      display: 'inline-flex',
+      alignItems: 'center',
+      width: '34px',
+      height: '20px',
+      boxSizing: 'border-box',
+      padding: '2px',
+      border: enabled ? 0 : '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.55))',
+      borderRadius: '999px',
+      background: enabled
+        ? 'var(--dsw-alias-brand-primary, #3d72f6)'
+        : 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.28))',
+      transition: 'background-color 150ms ease-out',
+    })
+    const providerSwitchThumbStyle = (enabled) => ({
+      display: 'block',
+      width: '16px',
+      height: '16px',
+      borderRadius: '50%',
+      background: 'var(--dsw-alias-bg-layer-1, #fff)',
+      transform: enabled ? 'translateX(14px)' : 'translateX(0)',
+      transition: 'transform 150ms ease-out',
+    })
     const loadingBodyStyle = {
       position: 'relative',
       zIndex: 1,
@@ -517,7 +637,7 @@ window.__ModuleLoader__.load({
         onFocus: onOpen,
         onBlur: onClose,
         tabIndex: 0,
-        role: 'button',
+        role: 'group',
         title: entry.providerName ?? entry.provider,
         'aria-label': entry.providerName ?? entry.provider,
       },
@@ -555,14 +675,91 @@ window.__ModuleLoader__.load({
       return value
     }
 
+    function readVisibilityValue(raw) {
+      try {
+        const saved = JSON.parse(raw)
+        if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) return null
+        const entries = Object.entries(saved)
+        if (entries.some(([provider, enabled]) => provider === '' || typeof enabled !== 'boolean')) return null
+        return Object.fromEntries(entries)
+      } catch {
+        return null
+      }
+    }
+
+    function readProviderVisibility() {
+      try {
+        const currentRaw = window.localStorage.getItem(PROVIDER_VISIBILITY_KEY)
+        if (currentRaw !== null) {
+          const current = readVisibilityValue(currentRaw)
+          if (current !== null) return current
+        }
+        const legacyRaw = window.localStorage.getItem(LEGACY_LOCAL_VISIBILITY_KEY)
+        return legacyRaw === null ? {} : (readVisibilityValue(legacyRaw) ?? {})
+      } catch {
+        // Storage can be disabled by browser policy; use the default display.
+        return {}
+      }
+    }
+
+    function persistProviderVisibility(value) {
+      try {
+        window.localStorage.setItem(PROVIDER_VISIBILITY_KEY, JSON.stringify(value))
+      } catch {
+        // Keep the in-memory toggle usable when storage is unavailable.
+      }
+    }
+
+    function ProviderVisibilitySettings({ providers, visibility, t, onToggle }) {
+      return h('div', {
+        style: providerSettingsPanelStyle,
+        role: 'dialog',
+        'aria-label': t('providerQuotaTitle'),
+        onClick: (event) => event.stopPropagation(),
+      },
+      h('div', { style: cardTitleStyle }, t('providerQuotaTitle')),
+      h('div', { style: providerSettingsHintStyle }, t('providerQuotaHint')),
+      providers.map((entry) => {
+        const provider = entry.provider
+        const enabled = visibility[provider] !== false
+        const name = entry.providerName ?? provider
+        return h('div', { key: provider, style: providerSettingRowStyle },
+          h(ProviderMark, { provider }),
+          h('span', { style: providerSettingNameStyle }, name),
+          h('button', {
+            type: 'button',
+            role: 'switch',
+            'aria-checked': enabled,
+            'aria-label': t('showProviderQuota', { provider: name }),
+            style: providerSwitchButtonStyle,
+            onClick: (event) => {
+              event.stopPropagation()
+              onToggle(provider)
+            },
+          },
+          h('span', { style: providerSwitchTrackStyle(enabled) },
+            h('span', { style: providerSwitchThumbStyle(enabled) }),
+          ),
+          ),
+        )
+      }),
+      )
+    }
+
     function QuotaBar({ t }) {
       const [view, setView] = React.useState({ phase: 'loading', providers: [], intervalSec: 60 })
+      const [providerVisibility, setProviderVisibility] = React.useState(readProviderVisibility)
+      const [providerSettingsOpen, setProviderSettingsOpen] = React.useState(false)
       const [nonce, setNonce] = React.useState(0)
       const [refreshing, setRefreshing] = React.useState(false)
       const [openProvider, setOpenProvider] = React.useState(null)
       const refreshRequestRef = React.useRef(false)
       const loadRef = React.useRef(null)
       const aliveRef = React.useRef(true)
+
+      React.useEffect(() => {
+        persistProviderVisibility(providerVisibility)
+      }, [providerVisibility])
 
       React.useEffect(() => {
         aliveRef.current = true
@@ -581,7 +778,9 @@ window.__ModuleLoader__.load({
             if (!aliveRef.current) return
             setRefreshing(false)
             setView((current) => (
-              current.phase === 'ready' ? current : { phase: 'error', providers: [], intervalSec: 60 }
+              current.phase === 'ready' || current.phase === 'empty'
+                ? current
+                : { phase: 'error', providers: [], intervalSec: 60 }
             ))
           }
         }
@@ -596,14 +795,24 @@ window.__ModuleLoader__.load({
       }, [nonce])
 
       React.useEffect(() => {
-        if (view.phase === 'empty') return undefined
+        // Keep polling while the row is hidden so newly available providers show up.
         const ms = Math.max(MIN_POLL_MS, view.intervalSec * 1000)
         const timer = setInterval(() => { void loadRef.current?.(false) }, ms)
         return () => { clearInterval(timer) }
       }, [view.phase, view.intervalSec])
 
-      // Close the hover card when the pointer leaves the whole row.
-      const onRowLeave = () => { setOpenProvider(null) }
+      // Close popovers when the pointer leaves the whole quota strip.
+      const onRowLeave = () => {
+        setOpenProvider(null)
+        setProviderSettingsOpen(false)
+      }
+      const toggleProviderVisibility = (provider) => {
+        setProviderVisibility((current) => ({
+          ...current,
+          [provider]: current[provider] === false,
+        }))
+        setOpenProvider(null)
+      }
 
       if (view.phase === 'empty') return null
       const refresh = () => {
@@ -665,17 +874,54 @@ window.__ModuleLoader__.load({
           ),
         )
       }
+      const providersToDisplay = view.providers.filter((entry) => (
+        providerVisibility[entry.provider] !== false
+      ))
+
       return h('div', { style: dockStyle },
         h('div', {
           style: rootStyle,
-          role: 'status',
+          role: 'group',
           title: t('refresh'),
           'aria-label': t('label'),
           onMouseLeave: onRowLeave,
           onClick: refresh,
         },
         h('div', { style: fillStyle, 'aria-hidden': true }),
-        view.providers.map((entry) => h(ProviderChip, {
+        h('button', {
+          type: 'button',
+          style: refreshButtonStyle,
+          title: t('refresh'),
+          'aria-label': t('refresh'),
+          onClick: (event) => {
+            event.stopPropagation()
+            refresh()
+          },
+        },
+        h('svg', {
+          width: 14,
+          height: 14,
+          viewBox: '0 0 16 16',
+          fill: 'none',
+          'aria-hidden': true,
+          focusable: false,
+        },
+        h('path', {
+          d: 'M13.5 5.4A5.5 5.5 0 1 0 14 8',
+          stroke: 'currentColor',
+          strokeWidth: 1.4,
+          strokeLinecap: 'round',
+        }),
+        h('path', {
+          d: 'M13.1 2.8v3.1H10',
+          stroke: 'currentColor',
+          strokeWidth: 1.4,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+        }),
+        ),
+        ),
+        providersToDisplay.map((entry) => h(ProviderChip, {
           key: entry.provider,
           entry,
           t,
@@ -683,6 +929,49 @@ window.__ModuleLoader__.load({
           onOpen: () => { setOpenProvider(entry.provider) },
           onClose: () => { setOpenProvider((current) => (current === entry.provider ? null : current)) },
         })),
+        view.providers.length > 0
+          ? h('button', {
+            type: 'button',
+            style: providerSettingsButtonStyle,
+            title: t('manageProviderDisplay'),
+            'aria-label': t('manageProviderDisplay'),
+            'aria-expanded': providerSettingsOpen,
+            'aria-haspopup': 'dialog',
+            onClick: (event) => {
+              event.stopPropagation()
+              setOpenProvider(null)
+              setProviderSettingsOpen((open) => !open)
+            },
+          },
+          h('svg', {
+            width: 14,
+            height: 14,
+            viewBox: '0 0 16 16',
+            fill: 'none',
+            'aria-hidden': true,
+            focusable: false,
+          },
+          h('path', {
+            d: 'M2.5 4h11M2.5 8h11M2.5 12h11',
+            stroke: 'currentColor',
+            strokeWidth: 1.4,
+            strokeLinecap: 'round',
+          }),
+          h('circle', { cx: 6, cy: 4, r: 1.4, fill: 'var(--dsw-alias-bg-layer-1, #fff)', stroke: 'currentColor', strokeWidth: 1.2 }),
+          h('circle', { cx: 10, cy: 8, r: 1.4, fill: 'var(--dsw-alias-bg-layer-1, #fff)', stroke: 'currentColor', strokeWidth: 1.2 }),
+          h('circle', { cx: 5, cy: 12, r: 1.4, fill: 'var(--dsw-alias-bg-layer-1, #fff)', stroke: 'currentColor', strokeWidth: 1.2 }),
+          ),
+          h('span', null, t('providerDisplay')),
+          )
+          : null,
+        providerSettingsOpen && view.providers.length > 0
+          ? h(ProviderVisibilitySettings, {
+            providers: view.providers,
+            visibility: providerVisibility,
+            t,
+            onToggle: toggleProviderVisibility,
+          })
+          : null,
         ),
       )
     }
