@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "在输入框上方常驻一行，显示有内置适配器的供应商（opencode-go、command-code——Mars-Sea 的 dsh-commandcode-provider 用 id `commandcode` 注册的那个也认，以及本地 codex / Claude Code / Gemini CLI 登录态和 Antigravity 本地服务）的套餐余量：5 小时 / 每周 / 每月或按模型池分组的窗口，剩余比例与重置倒计时。",
+  "description": "在输入框上方和可选的侧栏登录信息上方显示供应商套餐余量（opencode-go、command-code、本地 Codex / Claude Code / Gemini CLI / Antigravity，以及 CLIProxyAPI 内置 OAuth 和支持额度查询的插件认证文件），含剩余比例、重置倒计时与窗口明细；显示选项与 CLIProxyAPI 管理由 DSH 插件设置页管理。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -14,7 +14,10 @@
     "provider",
     "claude",
     "gemini",
-    "antigravity"
+    "antigravity",
+    "cli-proxy-api",
+    "cliproxyapi",
+    "auth-files"
   ],
   "license": "MIT",
   "author": "bmqy",
@@ -53,7 +56,8 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
       ]
     }
   }

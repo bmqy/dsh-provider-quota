@@ -1,8 +1,7 @@
 // Provider quota bar — a compact row above the composer showing plan usage for
-// EVERY configured provider. It renders `GET /provider-quota/state`, served by
-// this package's host half, which discovers providers from the LLM registry,
-// resolves their keys through the credential seam and normalizes each
-// provider's quota endpoint.
+// configured providers. Quota data comes from this package's Host half through
+// document-relative routes that work in DSH Desktop and Web shells; upstream
+// requests and provider credentials remain on the Host.
 //
 // Compact face: one chip per provider — mark, remaining share of the most
 // binding window, and that window's countdown ("0% 5d 1h"). Hovering a chip
@@ -22,10 +21,15 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const NS = 'provider-quota'
-    const STATE_PATH = '/provider-quota/state'
+    // Keep these document-relative: DSH Desktop and Web mount the Client with
+    // a relative base, while leading slashes can escape the Desktop API mount.
+    const STATE_PATH = 'provider-quota/state'
+    const SETTINGS_PATH = 'provider-quota/settings'
     const MIN_POLL_MS = 30_000
     const PROVIDER_VISIBILITY_KEY = 'dsh-provider-quota:provider-visibility'
     const LEGACY_LOCAL_VISIBILITY_KEY = 'dsh-provider-quota:local-provider-visibility'
+    const DISPLAY_POSITIONS_KEY = 'dsh-provider-quota:display-positions'
+    const DEFAULT_DISPLAY_POSITIONS = { composer: true, sidebar: false }
 
     const copy = {
       zh: {
@@ -56,11 +60,59 @@ window.__ModuleLoader__.load({
         plan: '套餐 {tier}',
         fetched: '更新于 {time}',
         noWindows: '没有可显示的窗口',
-        providerDisplay: '显示设置',
+        noProviders: '暂无可显示余量',
         providerQuotaTitle: '供应商余量显示',
-        providerQuotaHint: '仅控制余量条显示，不影响检测和刷新',
-        manageProviderDisplay: '管理供应商余量显示',
+        providerQuotaHint: '展示位置和供应商可见性开关仅影响显示，不影响检测与刷新；CLIProxyAPI 配置会改变管理接口连接。',
+        providerSettingsTab: '余量',
+        providerListTitle: '供应商显示',
+        refreshProviderList: '刷新列表',
+        providerListError: '读取供应商列表失败',
         showProviderQuota: '显示 {provider} 余量',
+        displayLocations: '显示位置',
+        displayLocationsHint: '输入框上方和侧栏位置可独立开关，也可同时显示。此设置页始终可从“设置 → 插件”打开。',
+        composerLocation: '输入框上方',
+        sidebarLocation: '侧栏登录信息上方',
+        sidebarSummary: '打开供应商余量详情',
+        closeSidebarDetails: '关闭余量详情',
+        sidebarPanelTitle: '供应商余量',
+        sidebarProviderCount: '{count} 个供应商',
+        allProvidersHidden: '当前已隐藏所有供应商余量',
+        cliProxySettingsTitle: 'CLIProxyAPI 配置',
+        cliProxySettingsHint: '需要 CLIProxyAPI 的管理密钥；普通供应商 API Key 不适用。下方“清除”会同时移除已保存的管理地址和密钥，环境变量设置不受影响。',
+        cliProxyManagementUrl: '管理接口地址',
+        cliProxyManagementUrlPlaceholder: 'http://127.0.0.1:8317',
+        cliProxyManagementKey: '管理密钥',
+        cliProxyManagementKeyPlaceholder: '输入管理密钥；留空表示不更改',
+        cliProxyKeyConfigured: '管理密钥已配置',
+        cliProxyKeyMissing: '尚未配置管理密钥',
+        cliProxyKeyEntered: '新管理密钥已输入，尚未保存',
+        cliProxySave: '保存设置',
+        cliProxyClearSettings: '清除',
+        settingsLoading: '正在读取配置…',
+        settingsSaved: 'CLIProxyAPI 配置已保存',
+        settingsCleared: '已清除保存在 DSH 中的管理地址和密钥',
+        settingsLoadError: '读取配置失败',
+        settingsEndpointUnavailable: '宿主配置接口未加载（404）；请重启 DSH 后重试',
+        settingsSaveError: '保存配置失败',
+        settingsPartialSave: '部分设置可能已保存，请重新核对管理地址和密钥后重试。',
+        settingsErrorCredentialUnavailable: 'DSH 凭据存储服务未加载，无法保存管理密钥（credential-store-unavailable）',
+        settingsErrorCredentialWriteFailed: 'DSH 凭据存储写入失败；为避免泄露密钥或路径，未显示原始异常（credential-store-write-failed）',
+        settingsErrorCredentialPermission: '凭据存储无写入权限（credential-store-permission-denied）',
+        settingsErrorCredentialReadOnly: '凭据存储为只读（credential-store-read-only）',
+        settingsErrorCredentialNoSpace: '凭据存储所在磁盘空间不足（credential-store-no-space）',
+        settingsErrorCredentialPath: '凭据存储路径不可用（credential-store-path-unavailable）',
+        settingsErrorCredentialLock: '凭据存储正被占用或等待锁超时（credential-store-lock-timeout）',
+        settingsErrorCredentialMigration: '凭据文件需要先迁移到当前格式（credential-store-migration-required）',
+        settingsErrorCredentialDocument: '凭据文件格式无效（credential-store-document-invalid）',
+        settingsErrorCredentialVersion: '凭据文件版本不受支持（credential-store-version-unsupported）',
+        settingsErrorCredentialUnsafePermissions: '凭据文件权限过于宽松；请检查该文件的访问权限（credential-store-permissions-unsafe）',
+        settingsErrorSameOrigin: '保存被拒绝：请求来源校验失败（same-origin-required）',
+        settingsErrorSecurityUnavailable: 'Host 请求安全服务未加载，已拒绝保存（request-security-unavailable）',
+        settingsErrorRequestRejected: 'Host 拒绝了此设置请求；请从 DSH 桌面端重新打开面板后重试（request-rejected）',
+        settingsErrorJson: '保存失败：Host 接口要求 JSON 请求（application-json-required）',
+        settingsErrorInvalidPayload: '保存失败：请求参数无效',
+        settingsErrorNoChanges: '没有可保存的设置内容',
+        settingsInvalidUrl: '地址无效；请使用 HTTP 或 HTTPS URL',
       },
       en: {
         label: 'Quota',
@@ -90,11 +142,59 @@ window.__ModuleLoader__.load({
         plan: 'Plan {tier}',
         fetched: 'fetched {time}',
         noWindows: 'no windows to show',
-        providerDisplay: 'Display settings',
+        noProviders: 'No quota providers found yet',
         providerQuotaTitle: 'Provider quota display',
-        providerQuotaHint: 'Controls display only; detection and refresh are unchanged.',
-        manageProviderDisplay: 'Manage provider quota display',
+        providerQuotaHint: 'Display-location and provider-visibility switches only affect display; CLIProxyAPI settings change the management connection.',
+        providerSettingsTab: 'Provider quota',
+        providerListTitle: 'Provider visibility',
+        refreshProviderList: 'Refresh list',
+        providerListError: 'Could not load provider list',
         showProviderQuota: 'Show {provider} quota',
+        displayLocations: 'Display locations',
+        displayLocationsHint: 'Composer and sidebar are independent and may both be shown. This page is always available from Settings → Plugins.',
+        composerLocation: 'Above composer',
+        sidebarLocation: 'Above sidebar account row',
+        sidebarSummary: 'Open provider quota details',
+        closeSidebarDetails: 'Close quota details',
+        sidebarPanelTitle: 'Provider quota',
+        sidebarProviderCount: '{count} providers',
+        allProvidersHidden: 'All provider quotas are hidden',
+        cliProxySettingsTitle: 'CLIProxyAPI settings',
+        cliProxySettingsHint: 'Requires the CLIProxyAPI management secret; a normal provider API key will not work. Clear removes both the saved management URL and secret; environment variables are unaffected.',
+        cliProxyManagementUrl: 'Management API URL',
+        cliProxyManagementUrlPlaceholder: 'http://127.0.0.1:8317',
+        cliProxyManagementKey: 'Management secret',
+        cliProxyManagementKeyPlaceholder: 'Enter the management secret; leave blank to keep the current one',
+        cliProxyKeyConfigured: 'Management secret is configured',
+        cliProxyKeyMissing: 'Management secret is not configured',
+        cliProxyKeyEntered: 'New management secret entered but not saved',
+        cliProxySave: 'Save settings',
+        cliProxyClearSettings: 'Clear',
+        settingsLoading: 'Loading settings…',
+        settingsSaved: 'CLIProxyAPI settings saved',
+        settingsCleared: 'Saved DSH management URL and secret cleared',
+        settingsLoadError: 'Could not load settings',
+        settingsEndpointUnavailable: 'The Host settings endpoint is not loaded (404); restart DSH and try again.',
+        settingsSaveError: 'Could not save settings',
+        settingsPartialSave: 'Some settings may have been saved; verify the management URL and secret before retrying.',
+        settingsErrorCredentialUnavailable: 'The DSH credential store is not available; the management secret cannot be saved (credential-store-unavailable).',
+        settingsErrorCredentialWriteFailed: 'The DSH credential store could not write the setting. Raw details are hidden to protect secrets and file paths (credential-store-write-failed).',
+        settingsErrorCredentialPermission: 'The credential store is not writable (credential-store-permission-denied).',
+        settingsErrorCredentialReadOnly: 'The credential store is read-only (credential-store-read-only).',
+        settingsErrorCredentialNoSpace: 'The credential store has no available disk space (credential-store-no-space).',
+        settingsErrorCredentialPath: 'The credential store path is unavailable (credential-store-path-unavailable).',
+        settingsErrorCredentialLock: 'The credential store is busy or its write lock timed out (credential-store-lock-timeout).',
+        settingsErrorCredentialMigration: 'The credential file needs migration to the current format (credential-store-migration-required).',
+        settingsErrorCredentialDocument: 'The credential file format is invalid (credential-store-document-invalid).',
+        settingsErrorCredentialVersion: 'The credential file version is unsupported (credential-store-version-unsupported).',
+        settingsErrorCredentialUnsafePermissions: 'The credential file permissions are too broad; review its access permissions (credential-store-permissions-unsafe).',
+        settingsErrorSameOrigin: 'Save rejected: the request origin did not match DSH (same-origin-required).',
+        settingsErrorSecurityUnavailable: 'The Host request-security service is unavailable; the save was rejected (request-security-unavailable).',
+        settingsErrorRequestRejected: 'The Host rejected this settings request; reopen the panel in DSH Desktop and try again (request-rejected).',
+        settingsErrorJson: 'Save failed: the Host endpoint requires a JSON request (application-json-required).',
+        settingsErrorInvalidPayload: 'Save failed: the request fields are invalid.',
+        settingsErrorNoChanges: 'There are no settings changes to save.',
+        settingsInvalidUrl: 'Invalid URL; use an HTTP or HTTPS URL',
       },
     }
 
@@ -131,6 +231,71 @@ window.__ModuleLoader__.load({
       boxSizing: 'border-box',
       width: 'calc(100% - 2 * var(--dsh-composer-side-clearance, 16px) - 4 * var(--dsh-composer-dock-inset, 8px))',
       margin: '0 auto',
+    }
+    const sidebarSlotStyle = {
+      position: 'relative',
+      boxSizing: 'border-box',
+      width: '100%',
+      minWidth: 0,
+    }
+    const sidebarActionRowStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      width: '100%',
+      minWidth: 0,
+    }
+    const sidebarSummaryButtonStyle = (wide) => ({
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: wide ? 'flex-start' : 'center',
+      flex: wide ? '1 1 auto' : '0 0 44px',
+      gap: wide ? '7px' : '2px',
+      boxSizing: 'border-box',
+      width: wide ? 'auto' : '44px',
+      minWidth: '44px',
+      minHeight: '36px',
+      padding: wide ? '5px 8px' : '4px',
+      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
+      borderRadius: 'var(--dsw-radius-md, 8px)',
+      background: 'transparent',
+      color: 'var(--dsw-alias-label-secondary)',
+      font: 'inherit',
+      lineHeight: '18px',
+      cursor: 'pointer',
+      whiteSpace: 'nowrap',
+    })
+    const sidebarSummaryPercentStyle = {
+      fontVariantNumeric: 'tabular-nums',
+      fontWeight: 600,
+    }
+    const sidebarPopoverStyle = {
+      position: 'absolute',
+      left: 0,
+      bottom: 'calc(100% + 8px)',
+      zIndex: 50,
+      boxSizing: 'border-box',
+      width: '328px',
+      maxWidth: 'calc(100vw - 24px)',
+      maxHeight: 'min(70vh, 480px)',
+      overflowY: 'auto',
+      padding: '12px',
+      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
+      borderRadius: '10px',
+      background: 'var(--dsw-alias-bg-layer-1, #fff)',
+      boxShadow: 'var(--dsw-elevation-soft, 0 8px 24px rgba(0,0,0,0.16))',
+      color: 'var(--dsw-alias-label-secondary)',
+      fontSize: '12px',
+      lineHeight: '18px',
+    }
+    const sidebarProviderRowStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '8px',
+      minHeight: '30px',
+      padding: '3px 0',
+      borderBottom: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.18))',
     }
     // Card of a dock strip, copied 1:1 from the goal strip of the running app
     // (`@deepseek-ai/dsh-client-ui-goal` · `.Gc24Bq_bar`): 12px radius token, no
@@ -266,42 +431,42 @@ window.__ModuleLoader__.load({
       fontSize: '12.5px',
       margin: '0 0 6px',
     }
-    const providerSettingsPanelStyle = {
-      position: 'absolute',
-      right: 0,
-      bottom: '100%',
-      zIndex: 41,
+    const settingsPageStyle = {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '12px',
       boxSizing: 'border-box',
-      width: '256px',
-      maxWidth: 'calc(100vw - 48px)',
-      maxHeight: 'min(70vh, 480px)',
-      overflowY: 'auto',
-      padding: '12px',
-      borderRadius: '10px',
-      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
-      background: 'var(--dsw-alias-bg-layer-1, #fff)',
+      width: '100%',
+      minWidth: 0,
+      padding: '8px 0 20px',
       color: 'var(--dsw-alias-label-secondary)',
-      fontSize: '12px',
-      lineHeight: '18px',
-      cursor: 'default',
-      userSelect: 'text',
+      fontSize: '13px',
+      lineHeight: '20px',
     }
-    const providerSettingsButtonStyle = {
-      position: 'relative',
-      zIndex: 1,
-      display: 'inline-flex',
+    const settingsPageTitleStyle = {
+      margin: 0,
+      color: 'var(--dsw-alias-label-primary)',
+      fontSize: '16px',
+      fontWeight: 600,
+      lineHeight: '24px',
+    }
+    const settingsPageHeaderStyle = {
+      display: 'flex',
       alignItems: 'center',
-      gap: '5px',
-      marginLeft: 'auto',
-      padding: '4px 7px',
-      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
-      borderRadius: '999px',
-      background: 'transparent',
-      color: 'var(--dsw-alias-label-secondary)',
-      font: 'inherit',
-      lineHeight: '16px',
-      cursor: 'pointer',
-      whiteSpace: 'nowrap',
+      justifyContent: 'space-between',
+      gap: '12px',
+    }
+    const settingsSectionHeaderStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '12px',
+    }
+    const providerSettingListStyle = {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '4px',
+      marginTop: '8px',
     }
     const refreshButtonStyle = {
       position: 'relative',
@@ -325,31 +490,88 @@ window.__ModuleLoader__.load({
       fontSize: '11px',
       lineHeight: '15px',
     }
+    const settingsSectionStyle = {
+      boxSizing: 'border-box',
+      padding: '14px 16px',
+      border: '1px solid var(--dsw-alias-border-l1)',
+      borderRadius: '10px',
+      background: 'var(--dsw-alias-bg-layer-1)',
+    }
+    const settingsFieldStyle = {
+      display: 'block',
+      marginTop: '8px',
+      color: 'var(--dsw-alias-label-primary)',
+      fontSize: '11px',
+      fontWeight: 500,
+    }
+    const settingsInputStyle = {
+      display: 'block',
+      boxSizing: 'border-box',
+      width: '100%',
+      marginTop: '3px',
+      padding: '6px 8px',
+      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
+      borderRadius: '6px',
+      background: 'var(--dsw-alias-bg-base, #fff)',
+      color: 'var(--dsw-alias-label-primary)',
+      font: 'inherit',
+      fontSize: '12px',
+      lineHeight: '16px',
+    }
+    const settingsStatusStyle = {
+      marginTop: '7px',
+      color: 'var(--dsw-alias-label-secondary)',
+      fontSize: '11px',
+      lineHeight: '15px',
+      overflowWrap: 'anywhere',
+    }
+    const settingsActionsStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '8px',
+      marginTop: '10px',
+    }
+    const settingsActionButtonStyle = {
+      padding: '5px 8px',
+      border: '1px solid var(--dsw-alias-border-l1, rgba(127,127,127,0.28))',
+      borderRadius: '6px',
+      background: 'transparent',
+      color: 'var(--dsw-alias-label-secondary)',
+      font: 'inherit',
+      cursor: 'pointer',
+    }
+    const settingsPrimaryButtonStyle = {
+      ...settingsActionButtonStyle,
+      borderColor: 'var(--dsw-alias-brand-primary, #3d72f6)',
+      background: 'var(--dsw-alias-brand-primary, #3d72f6)',
+      color: 'var(--dsw-alias-bg-base, #fff)',
+      fontWeight: 600,
+    }
     const providerSettingRowStyle = {
       display: 'flex',
       alignItems: 'center',
       gap: '8px',
       minHeight: '30px',
     }
+    const providerSettingToggleRowStyle = {
+      ...providerSettingRowStyle,
+      justifyContent: 'space-between',
+      boxSizing: 'border-box',
+      width: '100%',
+      padding: 0,
+      border: 0,
+      background: 'transparent',
+      color: 'inherit',
+      font: 'inherit',
+      textAlign: 'left',
+      cursor: 'pointer',
+    }
     const providerSettingNameStyle = {
       flex: '1 1 auto',
       minWidth: 0,
       overflowWrap: 'anywhere',
       color: 'var(--dsw-alias-label-primary)',
-    }
-    const providerSwitchButtonStyle = {
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      flex: '0 0 auto',
-      width: '44px',
-      height: '28px',
-      padding: 0,
-      border: 0,
-      borderRadius: '999px',
-      background: 'transparent',
-      color: 'inherit',
-      cursor: 'pointer',
     }
     const providerSwitchTrackStyle = (enabled) => ({
       display: 'inline-flex',
@@ -374,13 +596,15 @@ window.__ModuleLoader__.load({
       transform: enabled ? 'translateX(14px)' : 'translateX(0)',
       transition: 'transform 150ms ease-out',
     })
+    // Keep the loading indicator in a single flex row at narrow widths.
     const loadingBodyStyle = {
       position: 'relative',
       zIndex: 1,
       display: 'flex',
       alignItems: 'center',
+      flex: '1 1 0',
+      minWidth: 0,
       gap: '10px',
-      width: '100%',
       padding: '2px 6px',
     }
     const loadingSpinnerStyle = {
@@ -651,7 +875,7 @@ window.__ModuleLoader__.load({
       },
       h('path', { d: chipArcPath, fill: chipArcFill }),
       ),
-      h(ProviderMark, { provider: entry.provider }),
+      h(ProviderMark, { provider: entry.markProvider ?? entry.provider }),
       failed
         ? h('span', { style: { color: SEVERITY_COLOR.danger } }, failureLabel(entry, t))
         : h('span', { style: { ...figureStyle, color: remaining <= 0 ? SEVERITY_COLOR.danger : undefined } },
@@ -671,6 +895,100 @@ window.__ModuleLoader__.load({
       const value = await response.json()
       if (value === null || typeof value !== 'object' || !Array.isArray(value.providers)) {
         throw new Error('unexpected quota payload')
+      }
+      return value
+    }
+
+    function settingsFailureMessage(error, t) {
+      if (error?.status === 404) return t('settingsEndpointUnavailable')
+      if (error?.code === 'invalid-management-url') return t('settingsInvalidUrl')
+
+      const reasons = {
+        'credential-store-permission-denied': 'settingsErrorCredentialPermission',
+        'credential-store-read-only': 'settingsErrorCredentialReadOnly',
+        'credential-store-no-space': 'settingsErrorCredentialNoSpace',
+        'credential-store-path-unavailable': 'settingsErrorCredentialPath',
+        'credential-store-lock-timeout': 'settingsErrorCredentialLock',
+        'credential-store-migration-required': 'settingsErrorCredentialMigration',
+        'credential-store-document-invalid': 'settingsErrorCredentialDocument',
+        'credential-store-version-unsupported': 'settingsErrorCredentialVersion',
+        'credential-store-permissions-unsafe': 'settingsErrorCredentialUnsafePermissions',
+        'credential-store-write-failed': 'settingsErrorCredentialWriteFailed',
+      }
+      const codes = {
+        'credential-store-unavailable': 'settingsErrorCredentialUnavailable',
+        'same-origin-required': 'settingsErrorSameOrigin',
+        'request-security-unavailable': 'settingsErrorSecurityUnavailable',
+        'request-rejected': 'settingsErrorRequestRejected',
+        'application-json-required': 'settingsErrorJson',
+        'invalid-settings-body': 'settingsErrorInvalidPayload',
+        'invalid-settings-fields': 'settingsErrorInvalidPayload',
+        'invalid-settings-value': 'settingsErrorInvalidPayload',
+        'invalid-management-key': 'settingsErrorInvalidPayload',
+        'no-settings-to-save': 'settingsErrorNoChanges',
+        'settings-unavailable': 'settingsLoadError',
+        'settings-save-failed': reasons[error?.reason] ?? 'settingsErrorCredentialWriteFailed',
+      }
+      const partialPrefix = error?.partial === true ? `${t('settingsPartialSave')} ` : ''
+      const translation = codes[error?.code] ?? reasons[error?.reason]
+      if (translation !== undefined) return `${partialPrefix}${t(translation)}`
+
+      const code = typeof error?.code === 'string' && /^[a-z][a-z0-9-]{0,63}$/.test(error.code)
+        ? error.code
+        : undefined
+      const status = Number.isInteger(error?.status) ? `HTTP ${String(error.status)}` : undefined
+      const detail = [code, status].filter(Boolean).join(' · ')
+      return detail === ''
+        ? `${partialPrefix}${t('settingsSaveError')}`
+        : `${partialPrefix}${t('settingsSaveError')} (${detail})`
+    }
+
+    async function readCliProxySettings(signal) {
+      const response = await fetch(SETTINGS_PATH, {
+        headers: { accept: 'application/json' },
+        cache: 'no-store',
+        signal,
+      })
+      if (!response.ok) {
+        let payload
+        try { payload = await response.json() } catch { payload = undefined }
+        const error = new Error(`HTTP ${String(response.status)}`)
+        error.status = response.status
+        error.code = payload?.error
+        error.reason = payload?.reason
+        throw error
+      }
+      const value = await response.json()
+      if (value === null || typeof value !== 'object'
+        || typeof value.managementUrl !== 'string'
+        || typeof value.managementKeyConfigured !== 'boolean') {
+        throw new Error('unexpected settings payload')
+      }
+      return value
+    }
+
+    async function writeCliProxySettings(settings) {
+      const response = await fetch(SETTINGS_PATH, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+        },
+        cache: 'no-store',
+        body: JSON.stringify(settings),
+      })
+      let value
+      try { value = await response.json() } catch { value = undefined }
+      if (!response.ok) {
+        const error = new Error(`HTTP ${String(response.status)}`)
+        error.status = response.status
+        error.code = value?.error
+        error.reason = value?.reason
+        error.partial = value?.partial === true
+        throw error
+      }
+      if (value === null || typeof value !== 'object' || value.ok !== true) {
+        throw new Error('unexpected settings response')
       }
       return value
     }
@@ -702,54 +1020,378 @@ window.__ModuleLoader__.load({
       }
     }
 
+    let providerVisibilitySnapshot
+    const providerVisibilityListeners = new Set()
+
+    function getProviderVisibility() {
+      if (providerVisibilitySnapshot === undefined) providerVisibilitySnapshot = readProviderVisibility()
+      return providerVisibilitySnapshot
+    }
+
     function persistProviderVisibility(value) {
+      providerVisibilitySnapshot = value
       try {
         window.localStorage.setItem(PROVIDER_VISIBILITY_KEY, JSON.stringify(value))
       } catch {
         // Keep the in-memory toggle usable when storage is unavailable.
       }
+      for (const listener of providerVisibilityListeners) listener(value)
     }
 
-    function ProviderVisibilitySettings({ providers, visibility, t, onToggle }) {
-      return h('div', {
-        style: providerSettingsPanelStyle,
-        role: 'dialog',
-        'aria-label': t('providerQuotaTitle'),
-        onClick: (event) => event.stopPropagation(),
-      },
-      h('div', { style: cardTitleStyle }, t('providerQuotaTitle')),
-      h('div', { style: providerSettingsHintStyle }, t('providerQuotaHint')),
-      providers.map((entry) => {
-        const provider = entry.provider
-        const enabled = visibility[provider] !== false
-        const name = entry.providerName ?? provider
-        return h('div', { key: provider, style: providerSettingRowStyle },
-          h(ProviderMark, { provider }),
-          h('span', { style: providerSettingNameStyle }, name),
+    function useProviderVisibility() {
+      const [visibility, setVisibility] = React.useState(getProviderVisibility)
+      React.useEffect(() => {
+        const listener = (value) => setVisibility(value)
+        providerVisibilityListeners.add(listener)
+        return () => providerVisibilityListeners.delete(listener)
+      }, [])
+      return [visibility, (provider) => {
+        const current = getProviderVisibility()
+        persistProviderVisibility({ ...current, [provider]: current[provider] === false })
+      }]
+    }
+
+    function readDisplayPositions() {
+      try {
+        const raw = window.localStorage.getItem(DISPLAY_POSITIONS_KEY)
+        if (raw === null) return { ...DEFAULT_DISPLAY_POSITIONS }
+        const saved = JSON.parse(raw)
+        if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
+          return { ...DEFAULT_DISPLAY_POSITIONS }
+        }
+        return {
+          composer: typeof saved.composer === 'boolean' ? saved.composer : DEFAULT_DISPLAY_POSITIONS.composer,
+          sidebar: typeof saved.sidebar === 'boolean' ? saved.sidebar : DEFAULT_DISPLAY_POSITIONS.sidebar,
+        }
+      } catch {
+        return { ...DEFAULT_DISPLAY_POSITIONS }
+      }
+    }
+
+    let displayPositionsSnapshot
+    const displayPositionsListeners = new Set()
+
+    function getDisplayPositions() {
+      if (displayPositionsSnapshot === undefined) displayPositionsSnapshot = readDisplayPositions()
+      return displayPositionsSnapshot
+    }
+
+    function updateDisplayPosition(position) {
+      const current = getDisplayPositions()
+      const next = { ...current, [position]: !current[position] }
+      displayPositionsSnapshot = next
+      try {
+        window.localStorage.setItem(DISPLAY_POSITIONS_KEY, JSON.stringify(next))
+      } catch {
+        // Keep the in-memory toggle usable when storage is unavailable.
+      }
+      for (const listener of displayPositionsListeners) listener(next)
+    }
+
+    function useDisplayPositions() {
+      const [positions, setPositions] = React.useState(getDisplayPositions)
+      React.useEffect(() => {
+        const listener = (value) => setPositions(value)
+        displayPositionsListeners.add(listener)
+        return () => displayPositionsListeners.delete(listener)
+      }, [])
+      return [positions, updateDisplayPosition]
+    }
+
+    function CliProxySettings({ t }) {
+      const [config, setConfig] = React.useState(null)
+      const [url, setUrl] = React.useState('')
+      const [secret, setSecret] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [message, setMessage] = React.useState(null)
+
+      const acceptConfig = (value) => {
+        setConfig({
+          managementUrl: value.managementUrl,
+          managementUrlValid: value.managementUrlValid !== false,
+          managementKeyConfigured: value.managementKeyConfigured,
+        })
+        setUrl(value.managementUrl)
+      }
+
+      React.useEffect(() => {
+        const controller = new AbortController()
+        void readCliProxySettings(controller.signal).then((value) => {
+          if (!controller.signal.aborted) acceptConfig(value)
+        }).catch((error) => {
+          if (!controller.signal.aborted) {
+            setMessage({
+              text: error?.status === 404 ? t('settingsEndpointUnavailable') : t('settingsLoadError'),
+              error: true,
+            })
+          }
+        })
+        return () => controller.abort()
+      }, [])
+
+      const save = async (event) => {
+        event.stopPropagation()
+        const trimmedUrl = url.trim()
+        if (trimmedUrl !== '') {
+          try {
+            const parsed = new URL(trimmedUrl)
+            if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username !== '' || parsed.password !== '') {
+              throw new Error('invalid URL')
+            }
+          } catch {
+            setMessage({ text: t('settingsInvalidUrl'), error: true })
+            return
+          }
+        }
+        setBusy(true)
+        setMessage(null)
+        try {
+          const value = await writeCliProxySettings({
+            managementUrl: trimmedUrl,
+            ...(secret.trim() === '' ? {} : { managementKey: secret }),
+          })
+          acceptConfig(value)
+          setSecret('')
+          setMessage({ text: t('settingsSaved'), error: false })
+        } catch (error) {
+          setMessage({ text: settingsFailureMessage(error, t), error: true })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const clearSettings = async (event) => {
+        event.stopPropagation()
+        setBusy(true)
+        setMessage(null)
+        try {
+          const value = await writeCliProxySettings({
+            clearManagementUrl: true,
+            clearManagementKey: true,
+          })
+          acceptConfig(value)
+          setSecret('')
+          setMessage({ text: t('settingsCleared'), error: false })
+        } catch (error) {
+          setMessage({ text: settingsFailureMessage(error, t), error: true })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      return h('div', { style: settingsSectionStyle, 'aria-busy': busy },
+        h('div', { style: cardTitleStyle }, t('cliProxySettingsTitle')),
+        h('div', { style: providerSettingsHintStyle }, t('cliProxySettingsHint')),
+        h('label', { style: settingsFieldStyle },
+          t('cliProxyManagementUrl'),
+          h('input', {
+            type: 'url',
+            value: url,
+            maxLength: 2048,
+            placeholder: t('cliProxyManagementUrlPlaceholder'),
+            autoComplete: 'url',
+            style: settingsInputStyle,
+            onChange: (event) => {
+              setUrl(event.target.value)
+              setMessage(null)
+            },
+            onClick: (event) => event.stopPropagation(),
+          }),
+        ),
+        h('label', { style: settingsFieldStyle },
+          t('cliProxyManagementKey'),
+          h('input', {
+            type: 'password',
+            value: secret,
+            maxLength: 8192,
+            placeholder: t('cliProxyManagementKeyPlaceholder'),
+            autoComplete: 'new-password',
+            style: settingsInputStyle,
+            onChange: (event) => {
+              setSecret(event.target.value)
+              setMessage(null)
+            },
+            onClick: (event) => event.stopPropagation(),
+          }),
+        ),
+        h('div', {
+          style: {
+            ...settingsStatusStyle,
+            color: config?.managementKeyConfigured && secret.trim() === ''
+              ? SEVERITY_COLOR.ok
+              : 'var(--dsw-alias-label-secondary)',
+          },
+          role: 'status',
+        },
+        secret.trim() !== ''
+          ? t('cliProxyKeyEntered')
+          : config === null
+            ? (message?.error ? null : t('settingsLoading'))
+            : config.managementKeyConfigured ? t('cliProxyKeyConfigured') : t('cliProxyKeyMissing'),
+        config?.managementUrlValid === false ? ` · ${t('settingsInvalidUrl')}` : null,
+        ),
+        message !== null && !message.error
+          ? h('div', { style: { ...settingsStatusStyle, color: SEVERITY_COLOR.ok }, role: 'status' }, message.text)
+          : null,
+        message?.error === true
+          ? h('div', { style: { ...settingsStatusStyle, color: SEVERITY_COLOR.danger }, role: 'alert' }, message.text)
+          : null,
+        h('div', { style: settingsActionsStyle },
           h('button', {
             type: 'button',
-            role: 'switch',
-            'aria-checked': enabled,
-            'aria-label': t('showProviderQuota', { provider: name }),
-            style: providerSwitchButtonStyle,
-            onClick: (event) => {
-              event.stopPropagation()
-              onToggle(provider)
+            style: { ...settingsPrimaryButtonStyle, opacity: busy ? 0.65 : 1 },
+            disabled: busy,
+            onClick: save,
+          }, t('cliProxySave')),
+          h('button', {
+            type: 'button',
+            style: {
+              ...settingsActionButtonStyle,
+              opacity: busy ? 0.55 : 1,
             },
-          },
-          h('span', { style: providerSwitchTrackStyle(enabled) },
-            h('span', { style: providerSwitchThumbStyle(enabled) }),
-          ),
-          ),
-        )
-      }),
+            disabled: busy,
+            onClick: clearSettings,
+          }, t('cliProxyClearSettings')),
+        ),
       )
     }
 
-    function QuotaBar({ t }) {
+    function SettingsSwitchRow({ label, enabled, onToggle }) {
+      return h('button', {
+        type: 'button',
+        role: 'switch',
+        'aria-checked': enabled,
+        'aria-label': label,
+        style: providerSettingToggleRowStyle,
+        onClick: (event) => {
+          event.stopPropagation()
+          onToggle()
+        },
+      },
+      h('span', { style: providerSettingNameStyle }, label),
+      h('span', { style: providerSwitchTrackStyle(enabled) },
+        h('span', { style: providerSwitchThumbStyle(enabled) }),
+      ),
+      )
+    }
+
+    function ProviderVisibilitySettings({ providers, phase, visibility, displayPositions, t, onToggle, onTogglePosition, onRefresh }) {
+      return h('div', {
+        style: settingsPageStyle,
+        'aria-label': t('providerQuotaTitle'),
+      },
+      h('header', { style: settingsPageHeaderStyle },
+        h('div', { style: { minWidth: 0 } },
+          h('h2', { style: settingsPageTitleStyle }, t('providerQuotaTitle')),
+          h('p', { style: { ...providerSettingsHintStyle, margin: '4px 0 0' } }, t('providerQuotaHint')),
+        ),
+      ),
+      h('section', { style: settingsSectionStyle },
+        h('h3', { style: { ...cardTitleStyle, fontSize: '13px' } }, t('displayLocations')),
+        h('p', { style: providerSettingsHintStyle }, t('displayLocationsHint')),
+        h(SettingsSwitchRow, {
+          label: t('composerLocation'),
+          enabled: displayPositions.composer,
+          onToggle: () => onTogglePosition('composer'),
+        }),
+        h(SettingsSwitchRow, {
+          label: t('sidebarLocation'),
+          enabled: displayPositions.sidebar,
+          onToggle: () => onTogglePosition('sidebar'),
+        }),
+      ),
+      h('section', { style: settingsSectionStyle, 'aria-busy': phase === 'loading' },
+        h('div', { style: settingsSectionHeaderStyle },
+          h('h3', { style: { ...cardTitleStyle, margin: 0, fontSize: '13px' } }, t('providerListTitle')),
+          h('button', {
+            type: 'button',
+            style: { ...settingsActionButtonStyle, whiteSpace: 'nowrap', opacity: phase === 'loading' ? 0.65 : 1 },
+            disabled: phase === 'loading',
+            onClick: onRefresh,
+          }, t('refreshProviderList')),
+        ),
+        phase === 'loading'
+          ? h('div', { style: { ...providerSettingsHintStyle, margin: '8px 0 0' }, role: 'status' }, t('loading'))
+          : phase === 'error'
+            ? h('div', { style: { ...providerSettingsHintStyle, margin: '8px 0 0' }, role: 'alert' }, t('providerListError'))
+            : providers.length === 0
+              ? h('div', { style: { ...providerSettingsHintStyle, margin: '8px 0 0' }, role: 'status' }, t('noProviders'))
+              : h('div', { style: providerSettingListStyle }, providers.map((entry) => {
+                const provider = entry.provider
+                const enabled = visibility[provider] !== false
+                const name = entry.providerName ?? provider
+                return h('button', {
+                  key: provider,
+                  type: 'button',
+                  role: 'switch',
+                  'aria-checked': enabled,
+                  'aria-label': t('showProviderQuota', { provider: name }),
+                  style: providerSettingToggleRowStyle,
+                  onClick: (event) => {
+                    event.stopPropagation()
+                    onToggle(provider)
+                  },
+                },
+                h(ProviderMark, { provider: entry.markProvider ?? provider }),
+                h('span', { style: providerSettingNameStyle }, name),
+                h('span', { style: { ...providerSwitchTrackStyle(enabled), flex: '0 0 34px' } },
+                  h('span', { style: providerSwitchThumbStyle(enabled) }),
+                ),
+                )
+              })),
+      ),
+      h(CliProxySettings, { t }),
+      )
+    }
+
+    function ProviderQuotaSettingsPage({ t }) {
+      const [visibility, toggleProviderVisibility] = useProviderVisibility()
+      const [displayPositions, toggleDisplayPosition] = useDisplayPositions()
+      const [view, setView] = React.useState({ phase: 'loading', providers: [] })
+      const [reloadNonce, setReloadNonce] = React.useState(0)
+
+      React.useEffect(() => {
+        const controller = new AbortController()
+        const load = async () => {
+          try {
+            const value = await readState(reloadNonce > 0, controller.signal)
+            if (controller.signal.aborted) return
+            const providers = Array.isArray(value.providers) ? value.providers : []
+            setView({ phase: providers.length === 0 ? 'empty' : 'ready', providers })
+          } catch {
+            if (!controller.signal.aborted) setView({ phase: 'error', providers: [] })
+          }
+        }
+        void load()
+        return () => controller.abort()
+      }, [reloadNonce])
+
+      const refresh = () => {
+        setView((current) => ({ ...current, phase: 'loading' }))
+        setReloadNonce((current) => current + 1)
+      }
+
+      return h(ProviderVisibilitySettings, {
+        providers: view.providers,
+        phase: view.phase,
+        visibility,
+        displayPositions,
+        t,
+        onToggle: toggleProviderVisibility,
+        onTogglePosition: toggleDisplayPosition,
+        onRefresh: refresh,
+      })
+    }
+
+    function QuotaBar({ t, placement = 'composer', wide = true }) {
+      const isSidebar = placement === 'sidebar'
       const [view, setView] = React.useState({ phase: 'loading', providers: [], intervalSec: 60 })
-      const [providerVisibility, setProviderVisibility] = React.useState(readProviderVisibility)
-      const [providerSettingsOpen, setProviderSettingsOpen] = React.useState(false)
+      const [providerVisibility] = useProviderVisibility()
+      const [displayPositions] = useDisplayPositions()
+      const placementEnabled = !isSidebar || displayPositions.sidebar
+      const [sidebarOpen, setSidebarOpen] = React.useState(false)
+      const sidebarSummaryTriggerRef = React.useRef(null)
+      const sidebarPanelInitialFocusRef = React.useRef(null)
       const [nonce, setNonce] = React.useState(0)
       const [refreshing, setRefreshing] = React.useState(false)
       const [openProvider, setOpenProvider] = React.useState(null)
@@ -758,10 +1400,7 @@ window.__ModuleLoader__.load({
       const aliveRef = React.useRef(true)
 
       React.useEffect(() => {
-        persistProviderVisibility(providerVisibility)
-      }, [providerVisibility])
-
-      React.useEffect(() => {
+        if (!placementEnabled) return undefined
         aliveRef.current = true
         const controller = new AbortController()
         const load = async (refresh) => {
@@ -792,41 +1431,227 @@ window.__ModuleLoader__.load({
           aliveRef.current = false
           controller.abort()
         }
-      }, [nonce])
+      }, [nonce, placementEnabled])
 
       React.useEffect(() => {
-        // Keep polling while the row is hidden so newly available providers show up.
+        // Keep polling while the composer row is hidden so newly available providers show up.
+        if (!placementEnabled) return undefined
         const ms = Math.max(MIN_POLL_MS, view.intervalSec * 1000)
         const timer = setInterval(() => { void loadRef.current?.(false) }, ms)
         return () => { clearInterval(timer) }
-      }, [view.phase, view.intervalSec])
+      }, [view.phase, view.intervalSec, placementEnabled])
 
-      // Close popovers when the pointer leaves the whole quota strip.
+      React.useEffect(() => {
+        if (!placementEnabled) setSidebarOpen(false)
+      }, [placementEnabled])
+
+      React.useEffect(() => {
+        if (sidebarOpen) sidebarPanelInitialFocusRef.current?.focus()
+      }, [sidebarOpen])
+
       const onRowLeave = () => {
         setOpenProvider(null)
-        setProviderSettingsOpen(false)
       }
-      const toggleProviderVisibility = (provider) => {
-        setProviderVisibility((current) => ({
-          ...current,
-          [provider]: current[provider] === false,
-        }))
-        setOpenProvider(null)
+      const closeSidebarDetails = () => {
+        setSidebarOpen(false)
+        sidebarSummaryTriggerRef.current?.focus()
       }
 
-      if (view.phase === 'empty') return null
       const refresh = () => {
         refreshRequestRef.current = true
         setRefreshing(true)
         setNonce((value) => value + 1)
       }
+      const providersToDisplay = view.providers.filter((entry) => (
+        providerVisibility[entry.provider] !== false
+      ))
+      if (isSidebar && !displayPositions.sidebar) return null
+      if (!isSidebar && !displayPositions.composer) return null
+      if (isSidebar) {
+        const summaryCandidates = providersToDisplay.map((entry) => {
+          const windows = orderWindows(Array.isArray(entry.windows) ? entry.windows : [])
+          const binding = windows.length > 0 ? bindingWindow(windows) : undefined
+          return { entry, binding }
+        }).filter((candidate) => Number.isFinite(candidate.binding?.remaining))
+        summaryCandidates.sort((a, b) => a.binding.remaining - b.binding.remaining)
+        const summary = summaryCandidates[0]
+        const statusText = summary !== undefined
+          ? formatPercent(summary.binding.remaining)
+          : view.phase === 'loading' || refreshing
+            ? t('loading')
+            : view.phase === 'error' ? t('unavailable') : '—'
+        const statusColor = summary === undefined
+          ? undefined
+          : SEVERITY_COLOR[severityOf(summary.binding.remaining)]
+        const compactStatusText = summary !== undefined
+          ? statusText
+          : view.phase === 'loading' || refreshing
+            ? '…'
+            : view.phase === 'error' ? '!' : '—'
+        const sidebarEmptyText = view.phase === 'loading' || refreshing
+          ? t('loading')
+          : view.phase === 'error'
+            ? t('unavailable')
+            : view.providers.length > 0 ? t('allProvidersHidden') : t('noProviders')
+        return h('div', { style: sidebarSlotStyle },
+          h('div', { style: sidebarActionRowStyle },
+            h('button', {
+              ref: sidebarSummaryTriggerRef,
+              type: 'button',
+              style: sidebarSummaryButtonStyle(wide),
+              title: t('sidebarSummary'),
+              'aria-label': t('sidebarSummary'),
+              'aria-expanded': sidebarOpen,
+              'aria-haspopup': 'dialog',
+              'aria-controls': 'provider-quota-sidebar-details',
+              onClick: (event) => {
+                event.stopPropagation()
+                setSidebarOpen((open) => !open)
+              },
+              onKeyDown: (event) => {
+                if (event.key === 'Escape' && sidebarOpen) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  closeSidebarDetails()
+                }
+              },
+            },
+            wide && summary !== undefined
+              ? h(ProviderMark, { provider: summary.entry.markProvider ?? summary.entry.provider })
+              : !wide ? h('svg', {
+                width: 10,
+                height: 10,
+                viewBox: '0 0 12 12',
+                fill: 'none',
+                'aria-hidden': true,
+                focusable: false,
+                style: { color: statusColor },
+              },
+              h('path', {
+                d: 'M2 9a4 4 0 1 1 8 0M6 6l2-1.5',
+                stroke: 'currentColor',
+                strokeWidth: 1.3,
+                strokeLinecap: 'round',
+              }),
+              ) : null,
+            wide ? h('span', null, t('label')) : null,
+            h('span', {
+              style: {
+                ...sidebarSummaryPercentStyle,
+                color: statusColor,
+                fontSize: wide ? undefined : '10px',
+              },
+              role: 'status',
+              'aria-live': 'polite',
+            }, wide ? statusText : compactStatusText),
+            wide ? h('span', {
+              style: { marginLeft: 'auto', color: 'var(--dsw-alias-label-tertiary)' },
+            }, t('sidebarProviderCount', { count: String(providersToDisplay.length) })) : null,
+            ),
+          ),
+          sidebarOpen ? h('div', {
+            id: 'provider-quota-sidebar-details',
+            style: sidebarPopoverStyle,
+            role: 'dialog',
+            'aria-label': t('sidebarPanelTitle'),
+            onClick: (event) => event.stopPropagation(),
+            onKeyDown: (event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                event.stopPropagation()
+                closeSidebarDetails()
+              }
+            },
+          },
+          h('div', {
+            style: { display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' },
+          },
+          h('div', { style: { ...cardTitleStyle, margin: 0 } }, t('sidebarPanelTitle')),
+          h('span', {
+            style: { marginLeft: 'auto', color: 'var(--dsw-alias-label-tertiary)', fontSize: '11px' },
+          }, t('sidebarProviderCount', { count: String(providersToDisplay.length) })),
+          h('button', {
+            ref: sidebarPanelInitialFocusRef,
+            type: 'button',
+            style: refreshButtonStyle,
+            title: t('refresh'),
+            'aria-label': t('refresh'),
+            onClick: (event) => {
+              event.stopPropagation()
+              refresh()
+            },
+          }, '↻'),
+          h('button', {
+            type: 'button',
+            style: refreshButtonStyle,
+            title: t('closeSidebarDetails'),
+            'aria-label': t('closeSidebarDetails'),
+            onClick: (event) => {
+              event.stopPropagation()
+              closeSidebarDetails()
+            },
+          }, '×'),
+          ),
+          providersToDisplay.length === 0
+            ? h('div', { style: noteStyle }, sidebarEmptyText)
+            : providersToDisplay.map((entry) => {
+              const windows = orderWindows(Array.isArray(entry.windows) ? entry.windows : [])
+              const binding = windows.length > 0 ? bindingWindow(windows) : undefined
+              const remaining = binding?.remaining
+              const summaryText = entry.status === 'error' && !Number.isFinite(remaining)
+                ? failureLabel(entry, t)
+                : formatPercent(remaining)
+              return h('div', {
+                key: entry.provider,
+                style: { ...sidebarProviderRowStyle, flexDirection: 'column', alignItems: 'stretch', gap: '6px', padding: '8px 0' },
+              },
+              h('div', {
+                style: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 },
+              },
+              h(ProviderMark, { provider: entry.markProvider ?? entry.provider }),
+              h('span', { style: { ...providerSettingNameStyle, flex: '1 1 auto' } }, entry.providerName ?? entry.provider),
+              h('span', {
+                style: {
+                  ...figureStyle,
+                  color: Number.isFinite(remaining) ? SEVERITY_COLOR[severityOf(remaining)] : undefined,
+                  flex: '0 0 auto',
+                },
+              }, summaryText),
+              ),
+              windows.length > 0
+                ? windows.map((window, index) => h(WindowRow, {
+                  key: `${String(window.tier)}-${String(index)}`,
+                  window,
+                  t,
+                }))
+                : h('div', { style: noteStyle }, entry.status === 'error' ? failureLabel(entry, t) : t('noWindows')),
+              )
+            }),
+          ) : null,
+        )
+      }
+      if (view.phase === 'empty') {
+        return h('div', { style: dockStyle },
+          h('div', {
+            style: { ...rootStyle, cursor: 'pointer' },
+            role: 'group',
+            'aria-label': t('label'),
+            onMouseLeave: onRowLeave,
+            onClick: refresh,
+          },
+          h('div', { style: fillStyle, 'aria-hidden': true }),
+          h('span', null, t('noProviders')),
+            ),
+        )
+      }
       if (view.phase === 'loading' || refreshing) {
         return h('div', { style: dockStyle },
           h('div', {
             style: rootStyle,
-            role: 'status',
+            role: 'group',
             'aria-label': t('loading'),
             'aria-live': 'polite',
+            onMouseLeave: onRowLeave,
           },
           h('div', { style: fillStyle, 'aria-hidden': true }),
           h('div', { style: loadingBodyStyle },
@@ -855,9 +1680,9 @@ window.__ModuleLoader__.load({
                 }),
               ),
             ),
-            h('div', { style: loadingLabelStyle }, t('loading')),
+            h('div', { style: loadingLabelStyle, role: 'status' }, t('loading')),
           ),
-          ),
+            ),
         )
       }
       if (view.phase === 'error') {
@@ -866,18 +1691,15 @@ window.__ModuleLoader__.load({
             style: { ...rootStyle, cursor: 'pointer' },
             title: t('refresh'),
             onClick: refresh,
-            role: 'status',
+            role: 'group',
             'aria-label': t('label'),
+            onMouseLeave: onRowLeave,
           },
           h('div', { style: fillStyle, 'aria-hidden': true }),
-          h('span', null, t('unavailable')),
-          ),
+          h('span', { role: 'status' }, t('unavailable')),
+            ),
         )
       }
-      const providersToDisplay = view.providers.filter((entry) => (
-        providerVisibility[entry.provider] !== false
-      ))
-
       return h('div', { style: dockStyle },
         h('div', {
           style: rootStyle,
@@ -929,49 +1751,6 @@ window.__ModuleLoader__.load({
           onOpen: () => { setOpenProvider(entry.provider) },
           onClose: () => { setOpenProvider((current) => (current === entry.provider ? null : current)) },
         })),
-        view.providers.length > 0
-          ? h('button', {
-            type: 'button',
-            style: providerSettingsButtonStyle,
-            title: t('manageProviderDisplay'),
-            'aria-label': t('manageProviderDisplay'),
-            'aria-expanded': providerSettingsOpen,
-            'aria-haspopup': 'dialog',
-            onClick: (event) => {
-              event.stopPropagation()
-              setOpenProvider(null)
-              setProviderSettingsOpen((open) => !open)
-            },
-          },
-          h('svg', {
-            width: 14,
-            height: 14,
-            viewBox: '0 0 16 16',
-            fill: 'none',
-            'aria-hidden': true,
-            focusable: false,
-          },
-          h('path', {
-            d: 'M2.5 4h11M2.5 8h11M2.5 12h11',
-            stroke: 'currentColor',
-            strokeWidth: 1.4,
-            strokeLinecap: 'round',
-          }),
-          h('circle', { cx: 6, cy: 4, r: 1.4, fill: 'var(--dsw-alias-bg-layer-1, #fff)', stroke: 'currentColor', strokeWidth: 1.2 }),
-          h('circle', { cx: 10, cy: 8, r: 1.4, fill: 'var(--dsw-alias-bg-layer-1, #fff)', stroke: 'currentColor', strokeWidth: 1.2 }),
-          h('circle', { cx: 5, cy: 12, r: 1.4, fill: 'var(--dsw-alias-bg-layer-1, #fff)', stroke: 'currentColor', strokeWidth: 1.2 }),
-          ),
-          h('span', null, t('providerDisplay')),
-          )
-          : null,
-        providerSettingsOpen && view.providers.length > 0
-          ? h(ProviderVisibilitySettings, {
-            providers: view.providers,
-            visibility: providerVisibility,
-            t,
-            onToggle: toggleProviderVisibility,
-          })
-          : null,
         ),
       )
     }
@@ -990,6 +1769,20 @@ window.__ModuleLoader__.load({
           order: 5,
           locale: NS,
         }, (props) => h(QuotaBar, { ...props, t: props.t ?? t })))
+        // DSH renders this footer action before `sidebar.settings`, above its account/login row.
+        ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+          name: 'sidebar.footer.action',
+          id: 'provider-quota',
+          order: 100,
+          label: () => t('label'),
+          locale: NS,
+        }, (props) => h(QuotaBar, { ...props, placement: 'sidebar', t: props.t ?? t })))
+        ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
+          name: 'settings.plugins.tab',
+          id: 'provider-quota',
+          order: 30,
+          label: () => t('providerSettingsTab'),
+        }, (props) => h(ProviderQuotaSettingsPage, { ...props, t: props.t ?? t })))
       },
     }
   },

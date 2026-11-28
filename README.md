@@ -1,20 +1,18 @@
 # 供应商余量
 
-DeepSeekRuntime（DSH）插件：在对话框上方常驻一行，把已配置供应商的套餐余量压成一排徽标——每个徽标是官方图标 + 最吃紧窗口的剩余比例 + 重置倒计时，鼠标悬停展开全部窗口的明细。
-
-![紧凑态：输入框上方的一排供应商徽标](docs/compact.png)
-
-![悬停明细：5 小时 / 每周 / 每月窗口的已用与剩余](docs/hover.png)
+DeepSeekRuntime（DSH）插件：默认在对话框上方常驻一行，把已配置供应商的套餐余量压成一排徽标——每个徽标是官方图标 + 最吃紧窗口的剩余比例 + 重置倒计时，鼠标悬停展开全部窗口的明细；也可独立启用位于登录信息行上方的侧栏余量摘要与详情面板。供应商显示、展示位置和 CLIProxyAPI 管理配置统一放在 **DSH 设置 → 插件 → 余量** 页面，不再占用余量条空间。
 
 ## 功能
 
 - **一行看完**：每个供应商一个徽标，例如 `[OpenAI 图标] 64% 6d 1h`——剩余比例取该供应商最吃紧的那个窗口，后面是它的重置倒计时。
 - **悬停即明细**：弹出卡片列出 5 小时 / 每周 / 每月窗口，或按模型、按模型池分组的窗口；每行给剩余比例、进度条、已用比例、重置倒计时与具体时刻。
 - **点一下刷新**：点击这一行立即重读，各供应商受自己的刷新下限保护，不会被供应商限流。
-- **只显示读得到的**：只出现本机确实能查到余量的供应商——有内置适配器的，以及本机登录了 Codex、Claude Code、Gemini CLI 或正在运行 Antigravity 的。
-- **供应商可单独开关**：余量条右侧的“显示设置”会列出当前所有已发现、可展示的供应商，可分别控制每个余量徽标；默认开启，设置保存在当前客户端浏览器中。隐藏徽标不会停止检测或刷新。
+- **只显示读得到的**：只出现本机确实能查到余量的供应商——有内置适配器的、本机登录了 Codex / Claude Code / Gemini CLI 或正在运行 Antigravity 的，以及 CLIProxyAPI 的内置 OAuth 账户和声明支持额度查询的插件认证文件。
+- **原生设置页**：在 **DSH 设置 → 插件 → 余量** 中分别控制供应商徽标显示、展示位置，并配置 CLIProxyAPI 管理接口地址和管理密钥；设置入口不再放在余量条上。
+- **位置可独立开关**：输入框上方默认开启；侧栏登录信息上方的摘要入口默认关闭。两处可单独开关或同时开启，设置保存在当前客户端浏览器中；关闭两处后仍可从 DSH 设置页打开。
+- **供应商可单独开关**：每个已发现的供应商默认显示；隐藏徽标不会停止检测或刷新。
 - **跟随主题与语言**：颜色取自 DSH 设计变量，中英文案内置，深浅主题都跟随。
-- **不占位**：一个能查到余量的供应商都没有时，整行不渲染。
+- **空状态仍可设置**：没有可显示的供应商时，余量条显示简短提示；全部显示选项仍可从 DSH 设置页管理。
 
 ## 支持的供应商
 
@@ -26,8 +24,22 @@ DeepSeekRuntime（DSH）插件：在对话框上方常驻一行，把已配置�
 | Claude Code（本地 CLI） | `~/.claude/.credentials.json` 里的 OAuth 登录态 | 5 小时 / 每周 / Sonnet、Opus 每周 / 每月 |
 | Gemini CLI（本地 CLI） | `~/.gemini/oauth_creds.json` 里的 OAuth 授权 | 按模型族：Gemini Pro / Flash / Flash Lite |
 | Antigravity（本地服务） | 本机 `language_server` 或 `agy` 进程的 loopback RPC | Gemini 池、Claude/GPT 池，各 5 小时 + 每周 |
+| CLIProxyAPI 内置 OAuth 账户 | 管理接口 `GET /v0/management/auth-files` + `POST /v0/management/api-call`；覆盖 Codex、Claude、Gemini CLI、Antigravity、Kimi、xAI、Devin、Meta | 每个账户单独显示；按供应商呈现 5 小时 / 每周 / 每月 / 每日或模型池窗口 |
+| CLIProxyAPI 插件型账户 | 管理接口 `GET /v0/management/auth-files` + `POST /v0/management/quota/fetch` | 仅查询 `supports_quota: true` 文件；窗口按接口返回的分组与重置时间展示 |
 
-自建中转站这类没有可查余量接口的供应商不会出现。
+CLIProxyAPI 中已识别的内置 OAuth 类型（Codex、Claude、Gemini CLI、Antigravity、Kimi、xAI、Devin、Meta）不依赖 `supports_quota` 标记，插件会经管理接口的 `api-call` 委托上游请求并解析对应额度；其它插件型供应商仅在 `supports_quota: true` 时走 `quota/fetch`。未适配的认证类型和没有可查余量接口的自建中转站不会出现。
+
+### 配置 CLIProxyAPI
+
+在 **DSH 设置 → 插件 → 余量** 页面中的“CLIProxyAPI 设置”填写管理接口地址和管理密钥，然后保存。默认地址为 `http://127.0.0.1:8317`，地址支持 HTTP/HTTPS；如果 URL 带 `/v1` 路径，插件会自动去掉该版本段再访问 `/v0/management/...`。
+
+这里需要的是 CLIProxyAPI 的管理密钥（`remote-management.secret-key` / `MANAGEMENT_PASSWORD`），**不是**给普通模型供应商使用的 API Key。管理接口须在 CLIProxyAPI 中启用并配置该管理密钥。密钥以密码框输入，保存在 DSH Host 凭据中，不会回传到浏览器；留空保存只更新地址、不修改现有密钥。**清除**会同时删除 DSH 保存的管理地址覆盖和管理密钥；如果进程环境设置了 `CLI_PROXY_MANAGEMENT_URL` / `CLI_PROXY_MANAGEMENT_KEY`，环境值仍会生效。
+
+也可以通过 Host 凭据或进程环境变量配置：`CLI_PROXY_MANAGEMENT_KEY` 是管理密钥，`CLI_PROXY_MANAGEMENT_URL` 是可选的管理地址覆盖。**不使用 DSH Web UI 时**，在启动 DSH Host 的进程环境中设置这两个变量即可；轮询、密钥解析和到 CLIProxyAPI 的请求均由 Host 完成，Web UI 只是可选的设置入口和展示层。已保存的 DSH Host 凭据优先于环境变量；清除后，地址回退到环境变量或默认地址，密钥回退到环境变量或未配置状态。
+
+本插件只向配置的管理地址发送管理 API 请求；管理密钥仅用于宿主侧 `Authorization: Bearer` 请求，不进入浏览器状态、日志或缓存。插件只将认证文件列表中的必要元数据用于展示，不把原始记录或访问令牌放入返回状态或日志。**仅将 URL 指向可信的 CLIProxyAPI 实例**，因为保存的地址会决定宿主发送管理密钥的位置。
+
+需要诊断 AI Providers 配置时，可对只读状态路由显式追加 `?includeCliProxyProviders=1`。响应中的 `cliProxyConfiguredProviders` 仅包含供应商名称、清理后的服务地址和禁用状态；不会返回模型、API Key 或完整管理 API 响应。服务地址中的 URL 用户信息、查询参数和片段会被剥除。该诊断沿用状态路由的访问范围，包含可能的内网地址；请勿将 DSH Web 监听端口暴露给不可信网络。
 
 ### Command Code：优先读上游插件的共享服务
 
@@ -43,11 +55,19 @@ DeepSeekRuntime（DSH）插件：在对话框上方常驻一行，把已配置�
 
 ## 界面
 
-紧凑态（不带标题文字；行首是刷新按钮，随后是供应商徽标，末尾是显示设置）：
+紧凑态（不带标题文字；行首是刷新按钮，随后是供应商徽标；展示选项统一由 DSH 原生插件设置页管理）：
 
 ```
-[↻] [opencode 官方图标] 0% 5d 1h   [command-code 官方图标] 0% 1d 11h   [OpenAI 官方图标] 64% 6d 1h   [Claude 官方图标] 67% 4h 12m   [Antigravity 官方图标] 79% 5d 2h   [显示设置]
+[↻] [opencode 官方图标] 0% 5d 1h   [command-code 官方图标] 0% 1d 11h   [OpenAI 官方图标] 64% 6d 1h   [Claude 官方图标] 67% 4h 12m   [Antigravity 官方图标] 79% 5d 2h
 ```
+
+可选侧栏入口（在 **设置 → 插件 → 余量** 单独开启；默认关闭）：
+
+```
+[供应商图标] 余量 64% · 5 个供应商
+```
+
+收起侧栏时摘要压缩为图标与最吃紧供应商的百分比；点击摘要展开供应商详情，可手动刷新。设置统一在 **DSH 设置 → 插件 → 余量** 中管理。侧栏余量摘要使用 DSH 原生 `sidebar.footer.action` 插槽；DSH 将此操作区渲染在 `sidebar.settings` 之前，因此余量条位于账户/登录信息行上方。
 
 - 徽标用**供应商官方站点的图标**（`opencode.ai`、`commandcode.ai`、`openai.com`、`claude.ai`、`gemini.google.com`、`antigravity.google`），32px PNG 以 data URL 内联，不额外发请求、不受 CSP 影响；没有登记图标的供应商回退成两个字母的首字母徽标。
 - 百分数是**剩余**比例，后面的 `5d 1h` 是它的重置倒计时。剩余 ≤20% 转警示色，≤0 标红。
@@ -85,6 +105,7 @@ opencode-go · 套餐 Go
 
 - **供应商列表**来自运行时 LLM 注册表，取其中有内置适配器的 id；新增、删除供应商会自动反映。`commandcode` 归到 `command-code` 适配器，`anthropic`、`claude-code`、`gemini-cli`、`google-gemini` 这类 id 归到对应适配器。
 - **本地 CLI / 本地服务**不在注册表里，单独作为常驻来源：`codex`、`claude`、`gemini` 各读自己的登录文件，并认自己的目录变量（`CODEX_HOME` / `CLAUDE_CONFIG_DIR` / `GEMINI_CLI_HOME`），**登录文件不存在就整条不出现**；`antigravity` 以进程在不在为准，没在跑就不出现。登录、启动之后再轮询一次就自己冒出来。
+- **CLIProxyAPI 认证文件**从管理接口读取；优先识别 Codex、Claude、Gemini CLI、Antigravity、Kimi、xAI、Devin、Meta 等内置 OAuth 类型并通过 `/v0/management/api-call` 查询，不要求 `supports_quota`；未识别的插件型供应商仅在 `supports_quota: true` 时走 `/v0/management/quota/fetch`。每个账户有独立徽标和缓存。
 - **Command Code 共享服务**（装了上游插件时）：`commandcodeUsage.report()` 由上游宿主半边提供，本插件只取 `active && configured` 那个账号的 `report.credits` / `report.plan` 换算窗口；服务不存在或抛错才走下面的直连接口。
 - **API Key** 通过凭据 seam 按环境变量名解析，改密钥后下一轮轮询就生效；解析失败时回退到进程环境变量，再失败则显示「未配置密钥」。一个供应商有多个环境变量名时按优先级依次尝试（`command-code`：`COMMANDCODE_API_KEY` → `COMMAND_CODE_API_KEY`）。
 - **用量接口**：
@@ -99,8 +120,10 @@ opencode-go · 套餐 Go
 | `claude`（本地 CLI） | `GET https://api.anthropic.com/api/oauth/usage` | `five_hour` → 5 小时、`seven_day` → 每周、`seven_day_sonnet` / `seven_day_opus` → 按模型的每周窗口、`extra_usage` → 每月；`utilization` 是**已用**比例，`resets_at` 是 ISO 时间 |
 | `gemini`（本地 CLI） | `POST …/v1internal:loadCodeAssist` + `POST …/v1internal:retrieveUserQuota` | `loadCodeAssist` 给套餐和 `cloudaicompanionProject`（查询必须带 project，拿不到时退回 Cloud Resource Manager 里 `gen-lang-client*` 或带 `generative-language` 标签的项目）；`buckets[]` 的 `modelId` 归到 Pro / Flash / Flash Lite 三组，`remainingFraction` 换算成已用，`resetTime` 是 ISO 时间 |
 | `antigravity`（本地服务） | `POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`（先 `GetUnleashData` 探活，失败退 `GetUserStatus` → `GetCommandModelConfigs`） | `response.groups[]` 里 `Gemini Models` / `Claude and GPT models` 两组，每组 `buckets[]` 的 `window`（`5h` / `weekly`）→ 4 个窗口；`remainingFraction` 换算成已用，`resetTime` 支持 ISO 或 epoch 秒 |
+| CLIProxyAPI 内置 OAuth（Codex / Claude / Gemini CLI / Antigravity / Kimi / xAI / Devin / Meta） | `GET {CLI_PROXY_MANAGEMENT_URL}/v0/management/auth-files` + `POST /v0/management/api-call`（Bearer 管理密钥） | 管理端代发各供应商 OAuth 请求；解析 5 小时、每周、每月、每日或按模型/模型池分组的窗口；内置类型不要求 `supports_quota` |
+| CLIProxyAPI 插件型账户 | `GET {CLI_PROXY_MANAGEMENT_URL}/v0/management/auth-files` + `POST /v0/management/quota/fetch`（Bearer 管理密钥） | 仅为 `supports_quota: true` 的文件查询；支持分组 buckets 的 `remainingFraction` / `usedPercent` / `resetTime`，窗口按 5 小时 / 每周 / 每月 / 其它归类 |
 
-本插件只访问上表这些供应商自己的余量接口，不向别处发送数据；图标是内联的 data URL，也不联网。
+本插件只访问上表这些供应商自己的余量接口，以及你显式配置的 CLIProxyAPI 管理地址；不会向浏览器发送管理密钥或认证文件访问令牌。图标是内联的 data URL，也不联网。
 
 Claude、Gemini、Antigravity 三条的接口形状照公开项目的做法实现：
 [Claude Code Usage Monitor 的 OAuth usage 说明](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor/issues/202)、

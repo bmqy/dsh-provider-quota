@@ -1,4 +1,4 @@
-// Host-half tests: the state route against synthetic provider responses.
+// Host state-route tests plus a Client settings-wiring regression.
 //
 // Every case re-imports `index.js` so its per-provider cache starts empty, and
 // points the CLI-login adapters at throwaway `CLAUDE_CONFIG_DIR` /
@@ -7,7 +7,7 @@
 // Run with: node --test test/
 
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -32,6 +32,8 @@ beforeEach(async () => {
     OPENCODE_GO_API_KEY: process.env.OPENCODE_GO_API_KEY,
     COMMANDCODE_API_KEY: process.env.COMMANDCODE_API_KEY,
     COMMAND_CODE_API_KEY: process.env.COMMAND_CODE_API_KEY,
+    CLI_PROXY_MANAGEMENT_KEY: process.env.CLI_PROXY_MANAGEMENT_KEY,
+    CLI_PROXY_MANAGEMENT_URL: process.env.CLI_PROXY_MANAGEMENT_URL,
   }
   process.env.USERPROFILE = join(root, 'home')
   process.env.HOME = join(root, 'home')
@@ -42,6 +44,8 @@ beforeEach(async () => {
   delete process.env.OPENCODE_GO_API_KEY
   delete process.env.COMMANDCODE_API_KEY
   delete process.env.COMMAND_CODE_API_KEY
+  delete process.env.CLI_PROXY_MANAGEMENT_KEY
+  delete process.env.CLI_PROXY_MANAGEMENT_URL
   await mkdir(join(root, 'home'), { recursive: true })
 })
 
@@ -90,8 +94,39 @@ async function startPlugin(options = {}) {
   const url = `${MODULE_URL}?case=${String(++caseId)}`
   const module = await import(url)
   const registered = []
+  const credentialStore = options.credentialStore ?? new Map()
+  const resolveCredential = async (ref) => {
+    if (credentialStore.has(ref)) return { value: credentialStore.get(ref), source: 'test-store' }
+    return options.resolve?.(ref)
+  }
+  const credentials = {
+    resolve: resolveCredential,
+    describe: options.describe ?? (async (ref) => ({
+      configured: credentialStore.has(ref)
+        || (typeof process.env[ref] === 'string' && process.env[ref].trim() !== '')
+        || (ref === 'CLI_PROXY_MANAGEMENT_KEY' && options.resolve !== undefined),
+      writable: true,
+    })),
+    set: async (ref, value) => {
+      await options.set?.(ref, value)
+      credentialStore.set(ref, value)
+    },
+    unset: async (ref) => {
+      await options.unset?.(ref)
+      credentialStore.delete(ref)
+    },
+  }
+  const connection = {
+    requestRejection(request) {
+      return options.requestRejection?.(request)
+    },
+  }
   const ctx = {
-    credentials: { resolve: options.resolve ?? (async () => undefined) },
+    get(name) {
+      if (name === 'credentials' && options.credentialsUnavailable !== true) return credentials
+      if (name === 'connection' && options.connectionUnavailable !== true) return connection
+      return undefined
+    },
     llm: { listProviders: () => options.providers ?? [] },
     inject(names, callback) {
       // The upstream Command Code plugin is optional: without it the plugin
@@ -112,6 +147,7 @@ async function startPlugin(options = {}) {
           return fn()
         },
         webServer: {
+          getOrigin: () => 'http://127.0.0.1:14102',
           register(route) {
             registered.push(route)
             return () => {}
@@ -121,21 +157,50 @@ async function startPlugin(options = {}) {
     },
   }
   module.apply(ctx)
-  assert.equal(registered.length, 1)
-  assert.equal(registered[0].path, '/provider-quota/state')
+  assert.deepEqual(registered.map((route) => route.path).sort(), [
+    '/provider-quota/settings',
+    '/provider-quota/state',
+  ])
 
-  const handler = registered[0].handler
-  async function state({ refresh = false } = {}) {
+  const stateHandler = registered.find((route) => route.path === '/provider-quota/state').handler
+  const settingsHandler = registered.find((route) => route.path === '/provider-quota/settings').handler
+  async function state({ refresh = false, includeCliProxyProviders = false } = {}) {
     const body = []
+    const params = new URLSearchParams()
+    if (refresh) params.set('refresh', '1')
+    if (includeCliProxyProviders) params.set('includeCliProxyProviders', '1')
+    const query = params.toString()
     const res = {
       writeHead() {},
       end(chunk) {
         body.push(String(chunk))
       },
     }
-    await handler({ method: 'GET', url: `/provider-quota/state${refresh ? '?refresh=1' : ''}` }, res)
+    await stateHandler({ method: 'GET', url: `/provider-quota/state${query === '' ? '' : `?${query}`}` }, res)
     return JSON.parse(body.join(''))
   }
+  async function settings({ method = 'GET', body, origin = 'http://127.0.0.1:14102', headers = {} } = {}) {
+    const chunks = []
+    let status
+    const requestHeaders = { host: '127.0.0.1:14102', ...headers }
+    if (method === 'POST') {
+      if (!Object.hasOwn(requestHeaders, 'content-type')) requestHeaders['content-type'] = 'application/json'
+      if (!Object.hasOwn(requestHeaders, 'origin') && origin !== null) requestHeaders.origin = origin
+    }
+    const req = { method, url: '/provider-quota/settings', headers: requestHeaders }
+    if (body !== undefined) {
+      const bytes = Buffer.from(JSON.stringify(body))
+      req[Symbol.asyncIterator] = async function* () { yield bytes }
+    }
+    const res = {
+      writeHead(code) { status = code },
+      end(chunk) { chunks.push(String(chunk)) },
+    }
+    await settingsHandler(req, res)
+    return { status, payload: JSON.parse(chunks.join('')) }
+  }
+  state.settings = settings
+  state.credentialStore = credentialStore
   // Test seam: let a case swap Antigravity's process/port/RPC transport.
   state.setAntigravityTransport = module.setAntigravityTransport
   return state
@@ -443,8 +508,9 @@ test('commandcode: the upstream registry id yields one command-code chip with ev
   assert.equal(Math.round(windowOf(entry, 'monthly').usedPercent), 21)
   assert.equal(windowOf(entry, 'monthly').resetAt, Date.parse('2026-12-01T00:00:00.000Z'))
 
-  // The key saved by the upstream plugin is the one sent, and only two requests go out.
-  assert.equal(asked[0], 'COMMANDCODE_API_KEY')
+  // The upstream plugin key is used; the optional CPA credential lookup is a separate no-op.
+  assert.ok(asked.includes('COMMANDCODE_API_KEY'))
+  assert.ok(asked.includes('CLI_PROXY_MANAGEMENT_KEY'))
   assert.deepEqual(calls.map((call) => call.url), [
     'https://api.commandcode.ai/alpha/billing/credits',
     'https://api.commandcode.ai/alpha/billing/subscriptions',
@@ -992,4 +1058,511 @@ test('antigravity: an unreachable server reports a failure instead of throwing',
 
   assert.equal(entry.status, 'error')
   assert.equal(entry.error.kind, 'http')
+})
+
+test('CLIProxyAPI: lists quota-capable auth files and normalizes their windows safely', async () => {
+  const managementKey = 'management-secret-must-not-leak'
+  process.env.CLI_PROXY_MANAGEMENT_URL = 'http://127.0.0.1:8317/v1/'
+  const calls = stubFetch((url, init) => {
+    assert.equal(init.headers.authorization, `Bearer ${managementKey}`)
+    if (url === 'http://127.0.0.1:8317/v0/management/auth-files') {
+      return response(200, {
+        files: [
+          {
+            name: 'claude-account.json',
+            provider: 'quota-plugin',
+            email: 'claude@example.test',
+            auth_index: 'a1b2c3d4e5f67890',
+            supports_quota: true,
+            access_token: 'auth-file-token-must-not-leak',
+          },
+          { name: 'unsupported.json', provider: 'openai', auth_index: 8, supports_quota: false },
+          { name: 'disabled.json', provider: 'gemini', auth_index: 9, supports_quota: true, disabled: true },
+        ],
+      })
+    }
+    if (url === 'http://127.0.0.1:8317/v0/management/quota/fetch') {
+      assert.equal(init.method, 'POST')
+      assert.deepEqual(JSON.parse(init.body), { auth_index: 'a1b2c3d4e5f67890', provider: 'quota-plugin' })
+      return response(200, {
+        groups: [{
+          displayName: 'Claude Pro',
+          buckets: [
+            { bucketId: 'five-hour', window: '5h', remainingFraction: 0.72, resetTime: '2026-11-27T12:00:00.000Z' },
+            { bucketId: 'weekly', window: 'weekly', remainingFraction: 0.4, resetTime: 1_795_000_000 },
+          ],
+        }],
+        subscription: { tierName: 'Pro' },
+      })
+    }
+    return undefined
+  })
+  const state = await startPlugin({
+    resolve: async (ref) => {
+      assert.equal(ref, 'CLI_PROXY_MANAGEMENT_KEY')
+      return { value: managementKey, source: 'test' }
+    },
+  })
+
+  const payload = await state()
+  const entries = payload.providers.filter((entry) => entry.provider.startsWith('cli-proxy-'))
+  assert.equal(entries.length, 1)
+  const entry = entries[0]
+  assert.equal(entry.status, 'ok')
+  assert.equal(entry.providerName, 'CLIProxy · quota-plugin · Account #1')
+  assert.equal(entry.markProvider, 'quota-plugin')
+  assert.equal(entry.planTier, 'Pro')
+  assert.equal(entry.windows[0].usedPercent, 28)
+  assert.equal(entry.windows[0].tier, 'five_hour')
+  assert.equal(entry.windows[0].resetAt, Date.parse('2026-11-27T12:00:00.000Z'))
+  assert.equal(entry.windows[1].usedPercent, 60)
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every((call) => !call.init.body?.includes(managementKey)))
+  const publicState = JSON.stringify(payload)
+  assert.equal(publicState.includes(managementKey), false)
+  assert.equal(publicState.includes('auth-file-token-must-not-leak'), false)
+  assert.equal(publicState.includes('a1b2c3d4e5f67890'), false)
+  assert.equal(publicState.includes('claude@example.test'), false)
+  assert.equal(publicState.includes('claude-account.json'), false)
+})
+
+test('CLIProxyAPI: optional provider-list probe returns only cleaned names and service URLs', async () => {
+  const managementKey = 'provider-list-management-secret'
+  const credentialStore = new Map([['CLI_PROXY_MANAGEMENT_KEY', managementKey]])
+  const calls = stubFetch((url, init) => {
+    assert.equal(init.headers.authorization, `Bearer ${managementKey}`)
+    if (url === 'http://127.0.0.1:8317/v0/management/auth-files') return response(200, { files: [] })
+    if (url === 'http://127.0.0.1:8317/v0/management/openai-compatibility') {
+      assert.equal(init.method, 'GET')
+      return response(200, {
+        'openai-compatibility': [
+          {
+            name: 'Provider One',
+            'base-url': 'https://api.one.example/v1?token=url-token-must-not-leak#fragment',
+            'api-key-entries': [{ name: 'main', 'api-key': 'provider-api-key-must-not-leak' }],
+          },
+          {
+            name: 'Provider Two',
+            'base-url': 'http://user:password@127.0.0.1:9000/v1',
+            disabled: true,
+            headers: { Authorization: 'header-secret-must-not-leak' },
+          },
+        ],
+      })
+    }
+    return undefined
+  })
+  const state = await startPlugin({ credentialStore })
+
+  const payload = await state({ includeCliProxyProviders: true })
+  assert.deepEqual(payload.cliProxyConfiguredProviders, {
+    status: 'ok',
+    providers: [
+      { name: 'Provider One', baseUrl: 'https://api.one.example/v1', disabled: false },
+      { name: 'Provider Two', baseUrl: 'http://127.0.0.1:9000/v1', disabled: true },
+    ],
+  })
+  assert.equal(calls.filter((call) => call.url.endsWith('/openai-compatibility')).length, 1)
+  const publicState = JSON.stringify(payload)
+  for (const secret of [managementKey, 'url-token-must-not-leak', 'provider-api-key-must-not-leak', 'header-secret-must-not-leak', 'password']) {
+    assert.equal(publicState.includes(secret), false)
+  }
+})
+
+test('CLIProxyAPI: provider-list probe returns only a safe management error category', async () => {
+  const managementKey = 'provider-list-management-secret'
+  const credentialStore = new Map([['CLI_PROXY_MANAGEMENT_KEY', managementKey]])
+  stubFetch((url, init) => {
+    assert.equal(init.headers.authorization, `Bearer ${managementKey}`)
+    return response(401, 'error body that must never be returned')
+  })
+  const state = await startPlugin({ credentialStore })
+
+  const payload = await state({ includeCliProxyProviders: true })
+  assert.deepEqual(payload.cliProxyConfiguredProviders, {
+    status: 'error',
+    error: 'management-auth-failed',
+    providers: [],
+  })
+  assert.equal(JSON.stringify(payload).includes('error body that must never be returned'), false)
+  assert.equal(JSON.stringify(payload).includes(managementKey), false)
+})
+
+test('CLIProxyAPI: Host environment credentials work without Client settings UI', async () => {
+  const managementKey = 'ambient-management-secret'
+  process.env.CLI_PROXY_MANAGEMENT_KEY = managementKey
+  const calls = stubFetch((url, init) => {
+    assert.equal(url, 'http://127.0.0.1:8317/v0/management/auth-files')
+    assert.equal(init.headers.authorization, `Bearer ${managementKey}`)
+    return response(200, { files: [] })
+  })
+  const state = await startPlugin()
+  const payload = await state({ refresh: true })
+  const settings = await state.settings()
+
+  assert.deepEqual(payload.providers, [])
+  assert.equal(settings.status, 200)
+  assert.equal(settings.payload.managementKeyConfigured, true)
+  assert.equal(JSON.stringify(settings).includes(managementKey), false)
+  assert.equal(calls.length, 1)
+})
+
+test('CLIProxyAPI: built-in OAuth auth files work without supports_quota and keep identities private', async () => {
+  const managementKey = 'management-secret-must-not-leak'
+  process.env.CLI_PROXY_MANAGEMENT_URL = 'http://127.0.0.1:8317'
+  const authFiles = [
+    { name: 'private-codex.json', email: 'codex@example.test', provider: 'openai-codex', auth_index: 'a1b2c3d4c0de0001', supports_quota: false, access_token: 'oauth-codex-secret' },
+    { name: 'private-claude.json', email: 'claude@example.test', provider: 'claude-code', auth_index: 'a1b2c3d4c0de0002', access_token: 'oauth-claude-secret' },
+    { name: 'private-gemini.json', email: 'gemini@example.test', provider: 'gemini-cli', auth_index: 'a1b2c3d4c0de0003', access_token: 'oauth-gemini-secret' },
+    { name: 'private-antigravity.json', email: 'ag@example.test', provider: 'antigravity', auth_index: 'a1b2c3d4c0de0004', access_token: 'oauth-ag-secret' },
+    { name: 'private-kimi.json', email: 'kimi@example.test', provider: 'moonshot', auth_index: 'a1b2c3d4c0de0005', access_token: 'oauth-kimi-secret' },
+    { name: 'private-xai.json', email: 'xai@example.test', provider: 'grok', auth_index: 'a1b2c3d4c0de0006', access_token: 'oauth-xai-secret' },
+    { name: 'private-devin.json', email: 'devin@example.test', provider: 'devin', auth_index: 'a1b2c3d4c0de0007', access_token: 'oauth-devin-secret' },
+    { name: 'private-meta.json', email: 'meta@example.test', provider: 'meta', auth_index: 'a1b2c3d4c0de0008', access_token: 'oauth-meta-secret' },
+  ]
+  const apiCalls = []
+  const managementResponse = (body) => response(200, { status_code: 200, body })
+  const calls = stubFetch((url, init) => {
+    assert.equal(init.headers.authorization, `Bearer ${managementKey}`)
+    if (url.endsWith('/v0/management/auth-files')) return response(200, { files: authFiles })
+    if (url.startsWith('http://127.0.0.1:8317/v0/management/auth-files/download?')) {
+      assert.equal(url, 'http://127.0.0.1:8317/v0/management/auth-files/download?name=private-meta.json')
+      return response(200, { dca_token: 'dca:private-meta-token' })
+    }
+    if (!url.endsWith('/v0/management/api-call')) return undefined
+    const request = JSON.parse(init.body)
+    apiCalls.push(request)
+    assert.equal(typeof request.auth_index, 'string')
+    assert.equal(typeof request.method, 'string')
+    assert.equal(typeof request.url, 'string')
+    assert.equal(typeof request.header, 'object')
+    if (request.url === 'https://chatgpt.com/backend-api/wham/usage') {
+      return managementResponse({ rate_limit: { primary_window: { used_percent: 25, reset_after_seconds: 1800 }, secondary_window: { used_percent: 40 } } })
+    }
+    if (request.url === 'https://api.anthropic.com/api/oauth/usage') {
+      return managementResponse({ five_hour: { utilization: 35, resets_at: '2026-11-28T00:00:00Z' }, seven_day: { utilization: 55 } })
+    }
+    if (request.url === 'https://api.anthropic.com/api/oauth/profile') {
+      return managementResponse({ account: { has_claude_pro: true } })
+    }
+    if (request.url === 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist') {
+      const project = request.auth_index === 'a1b2c3d4c0de0003' ? 'gemini-project' : 'antigravity-project'
+      return managementResponse({ cloudaicompanionProject: { id: project }, paidTier: { name: 'Pro' } })
+    }
+    if (request.url === 'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota') {
+      return managementResponse({ buckets: [{ modelId: 'gemini-2.5-pro', remainingFraction: 0.7, resetTime: '2026-11-28T00:00:00Z' }] })
+    }
+    if (request.url === 'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary') {
+      return managementResponse({ groups: [{ displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.75 }] }] })
+    }
+    if (request.url === 'https://api.kimi.com/coding/v1/usages') {
+      return managementResponse({ usage: { used: 20, limit: 100, reset_in: 3600 } })
+    }
+    if (request.url === 'https://cli-chat-proxy.grok.com/v1/billing?format=credits') {
+      return managementResponse({ creditUsagePercent: 25, currentPeriod: { end: '2026-11-30T00:00:00Z' } })
+    }
+    if (request.url === 'https://cli-chat-proxy.grok.com/v1/billing') {
+      return managementResponse({ monthlyLimit: { val: 100 }, used: { val: 40 } })
+    }
+    if (request.url === 'https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus') {
+      assert.equal(JSON.parse(request.data).metadata.apiKey, '$TOKEN$')
+      return managementResponse({ userStatus: { planStatus: { dailyQuotaRemainingPercent: 80, weeklyQuotaRemainingPercent: 60, planInfo: { planName: 'Pro' } } } })
+    }
+    if (request.url === 'https://api.meta.ai/muse-code/key') {
+      assert.equal(request.header.Authorization, 'Bearer dca:private-meta-token')
+      return managementResponse({ subs_tier_name: 'Pro', subs_usage: { window: { window_duration_mins: 300, used_percent: 20 }, weekly: { used_percent: 40 } } })
+    }
+    throw new Error(`unexpected built-in URL: ${request.url}`)
+  })
+  const state = await startPlugin({ resolve: async (ref) => (ref === 'CLI_PROXY_MANAGEMENT_KEY' ? { value: managementKey } : undefined) })
+
+  const payload = await state()
+  const entries = payload.providers.filter((entry) => entry.provider.startsWith('cli-proxy-'))
+  assert.equal(entries.length, authFiles.length)
+  assert.ok(entries.every((entry) => entry.status === 'ok'))
+  assert.equal(apiCalls.length, 12)
+  assert.ok(apiCalls.every((request) => authFiles.some((file) => file.auth_index === request.auth_index)))
+  assert.equal(windowOf(entryOf(payload, 'cli-proxy-codex-1'), 'five_hour').usedPercent, 25)
+  assert.equal(entryOf(payload, 'cli-proxy-claude-2').planTier, 'Pro')
+  assert.equal(Math.round(windowOf(entryOf(payload, 'cli-proxy-gemini-cli-3'), 'other').usedPercent), 30)
+  assert.equal(windowOf(entryOf(payload, 'cli-proxy-antigravity-4'), 'gemini_five_hour').usedPercent, 25)
+  assert.equal(windowOf(entryOf(payload, 'cli-proxy-kimi-5'), 'weekly').usedPercent, 20)
+  assert.equal(windowOf(entryOf(payload, 'cli-proxy-xai-6'), 'weekly').usedPercent, 25)
+  assert.equal(windowOf(entryOf(payload, 'cli-proxy-xai-6'), 'monthly').usedPercent, 40)
+  assert.equal(entryOf(payload, 'cli-proxy-devin-7').planTier, 'Pro')
+  assert.equal(windowOf(entryOf(payload, 'cli-proxy-meta-8'), 'five_hour').usedPercent, 20)
+  assert.ok(calls.every((call) => !call.init.body?.includes(managementKey)))
+  const publicState = JSON.stringify(payload)
+  for (const secret of [managementKey, ...authFiles.map((file) => file.auth_index), 'private-codex.json', 'private-meta.json', 'codex@example.test', 'oauth-codex-secret', 'oauth-claude-secret', 'oauth-gemini-secret', 'oauth-ag-secret', 'oauth-kimi-secret', 'oauth-xai-secret', 'oauth-devin-secret', 'oauth-meta-secret', 'dca:private-meta-token']) {
+    assert.equal(publicState.includes(secret), false, `public state must not contain ${secret}`)
+  }
+})
+
+test('CLIProxyAPI: does not call management APIs until a key is configured', async () => {
+  globalThis.fetch = async () => {
+    throw new Error('must not call CLIProxyAPI without a management key')
+  }
+  const state = await startPlugin()
+  assert.deepEqual((await state()).providers, [])
+})
+
+test('Host routes: save CLIProxyAPI credentials and retrieve quota without the Client UI', async () => {
+  const managementKey = 'settings-secret-must-not-leak'
+  const calls = stubFetch((url, init) => {
+    if (url === 'http://localhost:8317/v0/management/auth-files') {
+      assert.equal(init.headers.authorization, `Bearer ${managementKey}`)
+      return response(200, { files: [{ name: 'private-direct.json', provider: 'direct-provider', auth_index: 'a1b2c3d4e5f67890', supports_quota: true }] })
+    }
+    if (url === 'http://localhost:8317/v0/management/quota/fetch') {
+      assert.equal(init.headers.authorization, `Bearer ${managementKey}`)
+      assert.deepEqual(JSON.parse(init.body), { auth_index: 'a1b2c3d4e5f67890', provider: 'direct-provider' })
+      return response(200, { windows: [{ window: '5h', usedPercent: 25 }] })
+    }
+    return undefined
+  })
+  const state = await startPlugin()
+
+  const initial = await state.settings()
+  assert.equal(initial.status, 200)
+  assert.equal(initial.payload.managementUrl, 'http://127.0.0.1:8317')
+  assert.equal(initial.payload.managementKeyConfigured, false)
+
+  const saved = await state.settings({
+    method: 'POST',
+    body: { managementUrl: 'http://localhost:8317/v1/', managementKey },
+  })
+  assert.equal(saved.status, 200)
+  assert.equal(saved.payload.managementUrl, 'http://localhost:8317/v1/')
+  assert.equal(saved.payload.managementKeyConfigured, true)
+  assert.equal(JSON.stringify(saved).includes(managementKey), false)
+
+  const quotaPayload = await state()
+  assert.equal(quotaPayload.providers.length, 1)
+  assert.equal(quotaPayload.providers[0].provider, 'cli-proxy-direct-provider-1')
+  assert.equal(quotaPayload.providers[0].windows[0].usedPercent, 25)
+  assert.deepEqual(calls.map((call) => call.url), [
+    'http://localhost:8317/v0/management/auth-files',
+    'http://localhost:8317/v0/management/quota/fetch',
+  ])
+  assert.equal(JSON.stringify(quotaPayload).includes('a1b2c3d4e5f67890'), false)
+  assert.equal(JSON.stringify(quotaPayload).includes('settings-secret-must-not-leak'), false)
+
+  const cleared = await state.settings({
+    method: 'POST',
+    body: { clearManagementUrl: true, clearManagementKey: true },
+  })
+  assert.equal(cleared.status, 200)
+  assert.equal(cleared.payload.managementUrl, 'http://127.0.0.1:8317')
+  assert.equal(cleared.payload.managementKeyConfigured, false)
+  assert.equal(JSON.stringify(cleared).includes(managementKey), false)
+  assert.equal(calls.length, 2)
+})
+
+test('CLIProxyAPI settings: changing the management key invalidates cached quota', async () => {
+  const oldKey = 'previous-management-secret'
+  const newKey = 'current-management-secret'
+  const calls = []
+  const credentialStore = new Map([['CLI_PROXY_MANAGEMENT_KEY', oldKey]])
+  stubFetch((url, init) => {
+    calls.push({ url, authorization: init.headers.authorization })
+    if (init.headers.authorization === `Bearer ${oldKey}`) return response(200, { files: [] })
+    if (init.headers.authorization !== `Bearer ${newKey}`) return response(401, { error: 'unauthorized' })
+    if (url === 'http://127.0.0.1:8317/v0/management/auth-files') {
+      return response(200, { files: [{ name: 'current-account.json', provider: 'quota-plugin', auth_index: 'opaque-current-index', supports_quota: true }] })
+    }
+    if (url === 'http://127.0.0.1:8317/v0/management/quota/fetch') {
+      return response(200, { windows: [{ window: '5h', usedPercent: 20 }] })
+    }
+    return undefined
+  })
+  const state = await startPlugin({ credentialStore })
+  assert.deepEqual((await state()).providers, [])
+
+  const saved = await state.settings({ method: 'POST', body: { managementKey: newKey } })
+  assert.equal(saved.status, 200)
+  assert.equal(saved.payload.managementKeyConfigured, true)
+  const refreshed = await state({ refresh: true })
+
+  assert.equal(refreshed.providers.length, 1)
+  assert.equal(refreshed.providers[0].provider, 'cli-proxy-quota-plugin-1')
+  assert.equal(refreshed.providers[0].windows[0].usedPercent, 20)
+  assert.deepEqual(calls.map((call) => call.authorization), [
+    `Bearer ${oldKey}`,
+    `Bearer ${newKey}`,
+    `Bearer ${newKey}`,
+  ])
+  assert.equal(JSON.stringify(refreshed).includes(newKey), false)
+  assert.equal(JSON.stringify(refreshed).includes('opaque-current-index'), false)
+})
+
+test('CLIProxyAPI settings: uses ctx.get and identifies an unavailable credential service', async () => {
+  const state = await startPlugin({ credentialsUnavailable: true })
+  const result = await state.settings({
+    method: 'POST',
+    body: { managementKey: 'must-not-be-stored' },
+  })
+  assert.equal(result.status, 503)
+  assert.deepEqual(result.payload, { error: 'credential-store-unavailable' })
+  assert.equal(state.credentialStore.has('CLI_PROXY_MANAGEMENT_KEY'), false)
+})
+
+test('CLIProxyAPI settings: reports safe partial writes without leaking input', async () => {
+  const managementKey = 'settings-secret-must-not-leak'
+  const state = await startPlugin({
+    set: async (ref) => {
+      if (ref !== 'CLI_PROXY_MANAGEMENT_KEY') return
+      const error = new Error(`write denied for ${managementKey} at C:\\private\\credentials.yaml`)
+      error.code = 'EACCES'
+      throw error
+    },
+  })
+  const result = await state.settings({
+    method: 'POST',
+    body: { managementUrl: 'http://localhost:8317', managementKey },
+  })
+  assert.equal(result.status, 500)
+  assert.deepEqual(result.payload, {
+    error: 'settings-save-failed',
+    reason: 'credential-store-permission-denied',
+    partial: true,
+  })
+  assert.equal(state.credentialStore.get('CLI_PROXY_MANAGEMENT_URL'), 'http://localhost:8317')
+  assert.equal(state.credentialStore.has('CLI_PROXY_MANAGEMENT_KEY'), false)
+  assert.equal(JSON.stringify(result).includes(managementKey), false)
+  assert.equal(JSON.stringify(result).includes('C:\\private'), false)
+})
+
+test('CLIProxyAPI settings: rejects cross-origin writes and invalid management URLs', async () => {
+  const state = await startPlugin()
+  const denied = await state.settings({
+    method: 'POST',
+    origin: 'https://attacker.example',
+    body: { managementKey: 'must-not-be-stored' },
+  })
+  assert.equal(denied.status, 403)
+  assert.equal(state.credentialStore.has('CLI_PROXY_MANAGEMENT_KEY'), false)
+
+  const invalid = await state.settings({
+    method: 'POST',
+    body: { managementUrl: 'file:///etc/passwd' },
+  })
+  assert.equal(invalid.status, 400)
+  assert.equal(state.credentialStore.has('CLI_PROXY_MANAGEMENT_URL'), false)
+})
+
+test('CLIProxyAPI settings: Desktop Host calls without Origin can save through Connection admission', async () => {
+  const managementKey = 'desktop-settings-secret-must-not-leak'
+  let securityChecks = 0
+  const state = await startPlugin({
+    requestRejection(request) {
+      securityChecks += 1
+      assert.equal(request.headers.origin, undefined)
+      return undefined
+    },
+  })
+  const result = await state.settings({
+    method: 'POST',
+    origin: null,
+    body: { managementKey },
+  })
+
+  assert.equal(result.status, 200)
+  assert.equal(securityChecks, 1)
+  assert.equal(state.credentialStore.get('CLI_PROXY_MANAGEMENT_KEY'), managementKey)
+  assert.equal(JSON.stringify(result).includes(managementKey), false)
+})
+
+test('CLIProxyAPI settings: fails closed when Host request security is unavailable or denies the call', async () => {
+  const unavailable = await startPlugin({ connectionUnavailable: true })
+  const unavailableResult = await unavailable.settings({
+    method: 'POST',
+    body: { managementKey: 'must-not-be-stored' },
+  })
+  assert.equal(unavailableResult.status, 503)
+  assert.deepEqual(unavailableResult.payload, { error: 'request-security-unavailable' })
+  assert.equal(unavailable.credentialStore.has('CLI_PROXY_MANAGEMENT_KEY'), false)
+
+  const denied = await startPlugin({ requestRejection: () => 401 })
+  const deniedResult = await denied.settings({
+    method: 'POST',
+    origin: null,
+    body: { managementKey: 'must-not-be-stored' },
+  })
+  assert.equal(deniedResult.status, 401)
+  assert.deepEqual(deniedResult.payload, { error: 'request-rejected' })
+  assert.equal(denied.credentialStore.has('CLI_PROXY_MANAGEMENT_KEY'), false)
+})
+
+test('CLIProxyAPI: preserves same-named auth files with distinct auth indices', async () => {
+  process.env.CLI_PROXY_MANAGEMENT_URL = 'http://127.0.0.1:8317'
+  const calls = stubFetch((url, init) => {
+    if (url.endsWith('/v0/management/auth-files')) {
+      return response(200, {
+        files: [
+          { name: 'duplicate-account.json', provider: 'custom-test', auth_index: 'a1b2c3d4e5f67890', supports_quota: true },
+          { name: 'duplicate-account.json', provider: 'custom-test', auth_index: 'a1b2c3d4e5f67891', supports_quota: true },
+        ],
+      })
+    }
+    if (url.endsWith('/v0/management/quota/fetch')) {
+      const index = JSON.parse(init.body).auth_index
+      const usedPercent = index === 'a1b2c3d4e5f67890' ? 7 : 8
+      return response(200, { windows: [{ window: '5h', usedPercent }] })
+    }
+    return undefined
+  })
+  const state = await startPlugin({ resolve: async (ref) => (ref === 'CLI_PROXY_MANAGEMENT_KEY' ? { value: 'test-key' } : undefined) })
+
+  const entries = (await state()).providers.filter((entry) => entry.provider.startsWith('cli-proxy-'))
+  assert.equal(entries.length, 2)
+  assert.notEqual(entries[0].provider, entries[1].provider)
+  assert.deepEqual(entries.map((entry) => entry.windows[0].usedPercent), [7, 8])
+  assert.ok(entries[0].providerName.endsWith('#1'))
+  assert.ok(entries[1].providerName.endsWith('#2'))
+  const publicState = JSON.stringify(entries)
+  assert.equal(publicState.includes('a1b2c3d4e5f67890'), false)
+  assert.equal(publicState.includes('a1b2c3d4e5f67891'), false)
+  assert.equal(calls.length, 3)
+})
+
+test('CLIProxyAPI: skips auth files without quota support', async () => {
+  process.env.CLI_PROXY_MANAGEMENT_URL = 'http://127.0.0.1:8317'
+  const calls = stubFetch((url) => url.endsWith('/v0/management/auth-files')
+    ? response(200, { files: [{ name: 'plain.json', provider: 'openai', auth_index: 2, supports_quota: false }] })
+    : undefined)
+  const state = await startPlugin({ resolve: async (ref) => (ref === 'CLI_PROXY_MANAGEMENT_KEY' ? { value: 'test-key' } : undefined) })
+
+  assert.deepEqual((await state()).providers, [])
+  assert.equal(calls.length, 1)
+})
+
+test('CLIProxyAPI: management errors expose only a safe status category', async () => {
+  process.env.CLI_PROXY_MANAGEMENT_URL = 'http://127.0.0.1:8317'
+  const calls = stubFetch((url) => url.endsWith('/v0/management/auth-files')
+    ? response(401, { message: 'secret-bearing upstream body' })
+    : undefined)
+  const state = await startPlugin({ resolve: async (ref) => (ref === 'CLI_PROXY_MANAGEMENT_KEY' ? { value: 'private-management-key' } : undefined) })
+
+  const entry = entryOf(await state(), 'cli-proxy-api')
+  assert.equal(entry.status, 'error')
+  assert.equal(entry.error.kind, 'auth')
+  assert.equal(calls.length, 1)
+  const publicState = JSON.stringify(entry)
+  assert.equal(publicState.includes('private-management-key'), false)
+  assert.equal(publicState.includes('secret-bearing upstream body'), false)
+})
+
+test('Client: provider controls register in Plugins settings, not quota bars', async () => {
+  const [clientSource, packageText] = await Promise.all([
+    readFile(join(import.meta.dirname, '..', 'client.js'), 'utf8'),
+    readFile(join(import.meta.dirname, '..', 'package.json'), 'utf8'),
+  ])
+  const manifest = JSON.parse(packageText)
+
+  assert.match(clientSource, /ctx\.slots\.inject\('settings\.plugins\.tab'/)
+  assert.match(clientSource, /name: 'settings\.plugins\.tab',[\s\S]*?id: 'provider-quota',[\s\S]*?order: 30,[\s\S]*?label: \(\) => t\('providerSettingsTab'\)/)
+  assert.match(clientSource, /h\(ProviderQuotaSettingsPage/)
+  assert.match(clientSource, /if \(!isSidebar && !displayPositions\.composer\) return null/)
+  assert.doesNotMatch(clientSource, /renderSettingsButton|renderSettingsPanel|providerSettingsOpen/)
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-settings-plugins'))
 })

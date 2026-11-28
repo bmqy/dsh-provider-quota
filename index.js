@@ -1,9 +1,9 @@
 // Host half of the provider quota bar.
 //
-// One same-origin JSON route, `/provider-quota/state`, reports the plan usage
-// of every configured provider plus the local coding CLIs; the browser half
-// only renders that payload, so credentials and provider HTTP never reach the
-// browser.
+// Host JSON routes report quota state and expose CLIProxyAPI settings. The
+// Client calls them with document-relative paths shared by DSH Desktop and Web;
+// provider credentials and upstream requests stay on the Host, and settings
+// secrets are never returned to the Client.
 //
 // Providers come from two places:
 //   - the live LLM registry (`ctx.llm.listProviders()`), with API keys resolved
@@ -50,7 +50,9 @@ import { promisify } from 'node:util'
 const runCommand = promisify(execFile)
 
 const QUOTA_PATH = '/provider-quota/state'
+const QUOTA_SETTINGS_PATH = '/provider-quota/settings'
 const QUERY_TIMEOUT_MS = 10_000
+const SETTINGS_MAX_BODY_BYTES = 16 * 1024
 const CACHE_TTL_MS = 45_000
 const DETECT_TTL_MS = 120_000
 const DEFAULT_INTERVAL_SEC = 60
@@ -149,6 +151,45 @@ const GEMINI_FAMILIES = [
 
 /** At most this many per-model rows when no family name matches. */
 const GEMINI_LOOSE_WINDOW_LIMIT = 4
+
+// CLIProxyAPI exposes auth-file quotas through its read-only management API.
+// The management key is resolved at request time and never cached or returned.
+const CLI_PROXY_MANAGEMENT_KEY_REF = 'CLI_PROXY_MANAGEMENT_KEY'
+const CLI_PROXY_MANAGEMENT_URL_ENV = 'CLI_PROXY_MANAGEMENT_URL'
+const CLI_PROXY_DEFAULT_MANAGEMENT_URL = 'http://127.0.0.1:8317'
+const CLI_PROXY_CACHE_TTL_MS = 45_000
+const CLI_PROXY_REFRESH_FLOOR_MS = 30_000
+const CLI_PROXY_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+const CLI_PROXY_MAX_AUTH_FILES = 100
+const CLI_PROXY_MAX_CONFIGURED_PROVIDERS = 100
+const CLI_PROXY_MAX_CONCURRENCY = 4
+const CLI_PROXY_BUILTIN_PROVIDERS = new Set(['codex', 'claude', 'antigravity', 'gemini-cli', 'kimi', 'xai', 'devin', 'meta'])
+const CLI_PROXY_UPSTREAM = {
+  codexUsage: 'https://chatgpt.com/backend-api/wham/usage',
+  claudeUsage: 'https://api.anthropic.com/api/oauth/usage',
+  claudeProfile: 'https://api.anthropic.com/api/oauth/profile',
+  googleLoad: 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
+  googleQuota: 'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota',
+  antigravityQuota: [
+    'https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary',
+    'https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary',
+    'https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary',
+  ],
+  kimi: 'https://api.kimi.com/coding/v1/usages',
+  kimiAi: 'https://api.kimi.ai/coding/v1/usages',
+  meta: 'https://api.meta.ai/muse-code/key',
+  xaiWeekly: 'https://cli-chat-proxy.grok.com/v1/billing?format=credits',
+  xaiMonthly: 'https://cli-chat-proxy.grok.com/v1/billing',
+  devin: 'https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus',
+}
+const cliProxyCache = new Map()
+const cliProxyInflight = new Map()
+let cliProxyCacheGeneration = 0
+
+function invalidateCliProxyCache() {
+  cliProxyCacheGeneration += 1
+  cliProxyCache.clear()
+}
 
 export const name = 'provider-quota'
 export const inject = ['credentials', 'llm']
@@ -1370,6 +1411,918 @@ async function queryAntigravity() {
   throw lastError ?? new Error('antigravity did not answer its quota RPC')
 }
 
+function cpaSafeText(value, maxLength = 80) {
+  if (typeof value !== 'string' && typeof value !== 'number') return ''
+  return String(value).replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, maxLength)
+}
+
+function cpaFirstText(...values) {
+  for (const value of values) {
+    const text = cpaSafeText(value)
+    if (text !== '') return text
+  }
+  return ''
+}
+
+function cpaFlag(value) {
+  if (value === true || value === 1) return true
+  if (typeof value === 'string') return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase())
+  return false
+}
+
+function cpaSlug(value) {
+  return cpaSafeText(value, 100).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'account'
+}
+
+function cpaProviderLabel(value) {
+  const provider = cpaSafeText(value, 48)
+  const labels = {
+    anthropic: 'Claude',
+    claude: 'Claude',
+    'claude-code': 'Claude',
+    codex: 'Codex',
+    openai: 'OpenAI',
+    'openai-codex': 'Codex',
+    gemini: 'Gemini',
+    'gemini-cli': 'Gemini CLI',
+    'google-gemini': 'Gemini',
+    antigravity: 'Antigravity',
+    kimi: 'Kimi',
+    'moonshot': 'Kimi',
+    'kimi-ai': 'Kimi',
+    'kimi_ai': 'Kimi',
+    meta: 'Meta',
+    xai: 'xAI',
+    grok: 'xAI',
+    'x-ai': 'xAI',
+    devin: 'Devin',
+  }
+  return labels[provider.toLowerCase()] ?? (provider === '' ? 'CLIProxyAPI' : provider)
+}
+
+function cliProxyNormalizeProvider(value) {
+  const provider = cpaSafeText(value, 64).toLowerCase()
+  if (['anthropic', 'claude-code'].includes(provider)) return 'claude'
+  if (['openai-codex'].includes(provider)) return 'codex'
+  if (['gemini', 'google-gemini'].includes(provider)) return 'gemini-cli'
+  if (['grok', 'x-ai', 'x.ai'].includes(provider)) return 'xai'
+  if (['moonshot', 'kimi-ai', 'kimi_ai'].includes(provider)) return 'kimi'
+  return provider
+}
+
+/** Read the optional credential service through Cordis' supported lookup. */
+function credentialsOf(ctx) {
+  try {
+    const service = typeof ctx?.get === 'function' ? ctx.get('credentials') : undefined
+    if (service !== undefined && service !== null) return service
+  } catch {
+    // An optional credential provider may not be mounted in this profile.
+  }
+  return ctx?.credentials
+}
+
+/** Resolve CPA's management secret for every read; never retain it in cache/state. */
+async function readCliProxyManagementKey(ctx) {
+  try {
+    const resolved = await credentialsOf(ctx)?.resolve?.(CLI_PROXY_MANAGEMENT_KEY_REF)
+    const value = typeof resolved === 'string' ? resolved : resolved?.value
+    if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  } catch {
+    // Ambient environment credentials remain a supported fallback.
+  }
+  const ambient = process.env[CLI_PROXY_MANAGEMENT_KEY_REF]
+  return typeof ambient === 'string' && ambient.trim() !== '' ? ambient.trim() : undefined
+}
+
+/** Resolve the management URL from DSH credentials, environment, or the default. */
+async function readCliProxyManagementUrl(ctx) {
+  try {
+    const resolved = await credentialsOf(ctx)?.resolve?.(CLI_PROXY_MANAGEMENT_URL_ENV)
+    const value = typeof resolved === 'string' ? resolved : resolved?.value
+    if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  } catch {
+    // Ambient environment configuration remains a supported fallback.
+  }
+  const ambient = process.env[CLI_PROXY_MANAGEMENT_URL_ENV]
+  return typeof ambient === 'string' && ambient.trim() !== ''
+    ? ambient.trim()
+    : CLI_PROXY_DEFAULT_MANAGEMENT_URL
+}
+
+function cliProxyManagementOrigin(configured = undefined) {
+  const raw = typeof configured === 'string' && configured.trim() !== ''
+    ? configured.trim()
+    : CLI_PROXY_DEFAULT_MANAGEMENT_URL
+  try {
+    const url = new URL(raw)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') return undefined
+    const path = url.pathname.replace(/\/+$/, '').replace(/\/v1$/i, '').replace(/\/+$/, '')
+    return `${url.origin}${path}`
+  } catch {
+    return undefined
+  }
+}
+
+function cliProxyHttpError(status) {
+  const error = new Error('CLIProxyAPI management request failed')
+  error.status = status
+  error.kind = status === 401 ? 'auth' : status === 403 ? 'forbidden' : 'http'
+  return error
+}
+
+async function readCliProxyResponseBody(response) {
+  const reader = response.body?.getReader?.()
+  if (reader === undefined) {
+    const raw = await response.text()
+    if (Buffer.byteLength(raw, 'utf8') > CLI_PROXY_MAX_RESPONSE_BYTES) throw new Error('CLIProxyAPI response too large')
+    return raw
+  }
+
+  const chunks = []
+  let byteLength = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value)
+      byteLength += chunk.byteLength
+      if (byteLength > CLI_PROXY_MAX_RESPONSE_BYTES) {
+        try { await reader.cancel() } catch { /* ignore cancellation errors */ }
+        throw new Error('CLIProxyAPI response too large')
+      }
+      chunks.push(chunk)
+    }
+  } catch (error) {
+    try { await reader.cancel() } catch { /* ignore cancellation errors */ }
+    throw error
+  } finally {
+    try { reader.releaseLock() } catch { /* ignore release errors */ }
+  }
+
+  const bytes = new Uint8Array(byteLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return new TextDecoder().decode(bytes)
+}
+
+/** Bounded transport; never reads or returns an error body. */
+async function fetchCliProxyJson(url, managementKey, options = {}) {
+  const headers = { accept: 'application/json', authorization: `Bearer ${managementKey}` }
+  const init = {
+    method: options.method ?? 'GET',
+    headers,
+    redirect: 'error',
+    signal: AbortSignal.timeout(QUERY_TIMEOUT_MS),
+  }
+  if (options.body !== undefined) {
+    init.method = options.method ?? 'POST'
+    headers['content-type'] = 'application/json'
+    init.body = JSON.stringify(options.body)
+  }
+
+  const response = await fetch(url, init)
+  if (!response.ok) throw cliProxyHttpError(response.status)
+  const declared = Number(response.headers?.get?.('content-length'))
+  if (Number.isFinite(declared) && declared > CLI_PROXY_MAX_RESPONSE_BYTES) throw new Error('CLIProxyAPI response too large')
+  const raw = await readCliProxyResponseBody(response)
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new Error('CLIProxyAPI returned invalid JSON')
+  }
+}
+
+/** Return only safe provider labels and service URLs; never expose credentials. */
+function cliProxyConfiguredProviderRows(payload) {
+  const records = Array.isArray(payload) ? payload : payload?.['openai-compatibility']
+  if (!Array.isArray(records)) throw new Error('CLIProxyAPI provider-list response has an unexpected shape')
+
+  return records.slice(0, CLI_PROXY_MAX_CONFIGURED_PROVIDERS).flatMap((record) => {
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) return []
+    const name = cpaFirstText(record.name, record.id).slice(0, 120)
+    const rawBaseUrl = cpaFirstText(record['base-url'], record.baseUrl)
+    let baseUrl
+    if (rawBaseUrl !== '') {
+      try {
+        const url = new URL(rawBaseUrl)
+        if (['http:', 'https:'].includes(url.protocol)) {
+          // Drop userinfo, query, and fragment in case a URL was misconfigured
+          // with embedded credentials. Keep only the service origin + path.
+          baseUrl = `${url.origin}${url.pathname}`.slice(0, 2048)
+        }
+      } catch {
+        // Omit malformed service addresses instead of echoing raw input.
+      }
+    }
+    if (name === '' && baseUrl === undefined) return []
+    return [{
+      ...(name === '' ? {} : { name }),
+      ...(baseUrl === undefined ? {} : { baseUrl }),
+      disabled: cpaFlag(record.disabled),
+    }]
+  })
+}
+
+function cliProxyProviderConfigError(error) {
+  if (error?.kind === 'auth') return 'management-auth-failed'
+  if (error?.kind === 'forbidden') return 'management-forbidden'
+  if (error?.kind === 'http') return 'management-http-error'
+  if (error?.message?.includes('unexpected shape')) return 'invalid-response'
+  if (error?.message?.includes('invalid management URL')) return 'invalid-management-url'
+  return 'unavailable'
+}
+
+async function queryCliProxyConfiguredProviders(ctx) {
+  const managementKey = await readCliProxyManagementKey(ctx)
+  if (managementKey === undefined) return { status: 'unconfigured', providers: [] }
+
+  const origin = cliProxyManagementOrigin(await readCliProxyManagementUrl(ctx))
+  if (origin === undefined) return { status: 'error', error: 'invalid-management-url', providers: [] }
+
+  try {
+    const payload = await fetchCliProxyJson(`${origin}/v0/management/openai-compatibility`, managementKey)
+    return { status: 'ok', providers: cliProxyConfiguredProviderRows(payload) }
+  } catch (error) {
+    return { status: 'error', error: cliProxyProviderConfigError(error), providers: [] }
+  }
+}
+
+function cliProxyUnwrap(value) {
+  let current = value
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof current === 'string') {
+      try {
+        current = JSON.parse(current)
+      } catch {
+        return undefined
+      }
+    }
+    if (current === null || typeof current !== 'object' || Array.isArray(current)) return current
+    if (Array.isArray(current.groups) || Array.isArray(current.windows) || current.subscription !== undefined) return current
+    const nested = current.quota ?? current.body ?? current.data ?? current.result
+    if (nested === undefined || nested === null || nested === current) return current
+    current = nested
+  }
+  return current
+}
+
+function cliProxyObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function cliProxyPath(value, ...path) {
+  let current = value
+  for (const key of path) {
+    if (current === null || typeof current !== 'object') return undefined
+    current = current[key]
+  }
+  return current
+}
+
+function cliProxyWindow(tier, usedPercent, resetAt, name = '') {
+  if (!Number.isFinite(usedPercent) && !Number.isFinite(resetAt)) return undefined
+  return {
+    tier,
+    ...(Number.isFinite(usedPercent) ? { usedPercent: Math.max(0, Math.min(100, usedPercent)) } : {}),
+    ...(Number.isFinite(resetAt) && resetAt > 0 ? { resetAt } : {}),
+    ...(name === '' ? {} : { name }),
+  }
+}
+
+function cliProxyRelativeReset(value) {
+  const seconds = toFinite(value)
+  return seconds !== undefined && seconds >= 0 ? Date.now() + seconds * 1000 : undefined
+}
+
+function cliProxyPlanFromBody(body) {
+  if (!cliProxyObject(body)) return undefined
+  const plan = cpaFirstText(
+    body.plan_type, body.planType, body.account_type, body.accountType,
+    body.paidTier?.name, body.paid_tier?.name, body.currentTier?.name, body.currentTier?.id,
+    body.current_tier?.name, body.current_tier?.id,
+    body.subscription?.tierName, body.subscription?.tier_name, body.subscription?.plan,
+    body.organization?.organization_type,
+  )
+  return plan === '' ? undefined : plan.slice(0, 48)
+}
+
+function cliProxyCodexWindows(body) {
+  const rows = []
+  const addLimit = (info, label = '') => {
+    if (!cliProxyObject(info)) return
+    const exhausted = cpaFlag(info.limit_reached ?? info.limitReached) || info.allowed === false
+    for (const [slot, raw, fallbackTier] of [
+      ['primary', info.primary_window ?? info.primaryWindow, 'five_hour'],
+      ['secondary', info.secondary_window ?? info.secondaryWindow, 'weekly'],
+    ]) {
+      if (!cliProxyObject(raw)) continue
+      const seconds = toFinite(raw.limit_window_seconds ?? raw.limitWindowSeconds)
+      const tier = seconds === 18_000 ? 'five_hour' : seconds === 604_800 ? 'weekly' : (seconds === undefined ? fallbackTier : 'other')
+      let used = cliProxyPercent(raw.used_percent ?? raw.usedPercent)
+      const resetAt = cliProxyEpoch(raw.reset_at ?? raw.resetAt) ?? cliProxyRelativeReset(raw.reset_after_seconds ?? raw.resetAfterSeconds)
+      if (used === undefined && exhausted) used = 100
+      const name = label === '' ? '' : `${label} ${slot === 'primary' ? '5h' : 'weekly'}`
+      const window = cliProxyWindow(tier, used, resetAt, name)
+      if (window !== undefined) rows.push(window)
+    }
+  }
+  addLimit(body?.rate_limit ?? body?.rateLimit)
+  addLimit(body?.code_review_rate_limit ?? body?.codeReviewRateLimit, 'Code review')
+  const extras = body?.additional_rate_limits ?? body?.additionalRateLimits
+  if (Array.isArray(extras)) {
+    extras.forEach((item, index) => {
+      if (!cliProxyObject(item)) return
+      addLimit(item.rate_limit ?? item.rateLimit, cpaFirstText(item.limit_name, item.limitName, item.metered_feature, item.meteredFeature, `Extra ${index + 1}`))
+    })
+  }
+  return rows
+}
+
+function cliProxyClaudeWindows(body) {
+  const rows = []
+  const definitions = [
+    ['five_hour', 'five_hour', '5h'],
+    ['seven_day', 'weekly', 'weekly'],
+    ['seven_day_oauth_apps', 'weekly', 'OAuth apps weekly'],
+    ['seven_day_opus', 'weekly', 'Opus weekly'],
+    ['seven_day_sonnet', 'weekly', 'Sonnet weekly'],
+    ['seven_day_cowork', 'weekly', 'Cowork weekly'],
+    ['iguana_necktie', 'weekly', 'Fable weekly'],
+  ]
+  for (const [key, tier, label] of definitions) {
+    const raw = body?.[key]
+    if (!cliProxyObject(raw)) continue
+    const window = cliProxyWindow(tier, cliProxyPercent(raw.utilization), cliProxyEpoch(raw.resets_at ?? raw.resetsAt ?? raw.reset_at ?? raw.resetAt), tier === 'weekly' && key !== 'seven_day' ? label : '')
+    if (window !== undefined) rows.push(window)
+  }
+  if (Array.isArray(body?.limits)) {
+    for (const limit of body.limits) {
+      if (!cliProxyObject(limit) || cpaSafeText(limit.kind, 40).toLowerCase() !== 'weekly_scoped') continue
+      const model = cpaSafeText(cliProxyPath(limit, 'scope', 'model', 'display_name'), 64)
+      if (model === '') continue
+      const window = cliProxyWindow('weekly', cliProxyPercent(limit.percent), cliProxyEpoch(limit.resets_at ?? limit.resetAt), model)
+      if (window !== undefined) rows.push(window)
+    }
+  }
+  const extra = body?.extra_usage
+  const limit = toFinite(extra?.monthly_limit)
+  const used = toFinite(extra?.used_credits)
+  if (limit !== undefined && limit > 0 && used !== undefined) {
+    const window = cliProxyWindow('monthly', used / limit * 100, undefined, 'Extra usage')
+    if (window !== undefined) rows.push(window)
+  }
+  return rows
+}
+
+function cliProxyClaudePlan(profile) {
+  const hasMax = cliProxyPath(profile, 'account', 'has_claude_max')
+  const hasPro = cliProxyPath(profile, 'account', 'has_claude_pro')
+  const orgType = cpaSafeText(cliProxyPath(profile, 'organization', 'organization_type'), 64).toLowerCase()
+  const status = cpaSafeText(cliProxyPath(profile, 'organization', 'subscription_status'), 32).toLowerCase()
+  if (cpaFlag(hasMax)) return 'Max'
+  if (cpaFlag(hasPro)) return 'Pro'
+  if (orgType === 'claude_team' && status === 'active') return 'Team'
+  if (orgType === 'claude_enterprise' && status === 'active') return 'Enterprise'
+  if (hasMax === false && hasPro === false) return 'Free'
+  return cliProxyPlanFromBody(profile)
+}
+
+function cliProxyGoogleHeaders(metadata) {
+  return {
+    Authorization: 'Bearer $TOKEN$',
+    'Content-Type': 'application/json',
+    'User-Agent': 'google-api-nodejs-client/9.15.1',
+    'X-Goog-Api-Client': 'google-cloud-sdk vscode_cloudshelleditor/0.1',
+    'Client-Metadata': JSON.stringify(metadata),
+  }
+}
+
+function cliProxyAntigravityHeaders() {
+  return { Authorization: 'Bearer $TOKEN$', 'Content-Type': 'application/json', 'User-Agent': 'antigravity/hub/2.23.0 darwin/arm64' }
+}
+
+function cliProxyProjectId(entry) {
+  return cpaFirstText(
+    entry?.project_id, entry?.projectId,
+    cliProxyPath(entry, 'metadata', 'project_id'), cliProxyPath(entry, 'metadata', 'projectId'),
+    cliProxyPath(entry, 'attributes', 'project_id'), cliProxyPath(entry, 'attributes', 'projectId'),
+    cliProxyPath(entry, 'attributes', 'gemini_virtual_project'),
+    cliProxyPath(entry, 'cloudaicompanion_project', 'id'), cliProxyPath(entry, 'cloudaicompanionProject', 'id'),
+  )
+}
+
+function cliProxyGoogleProject(body) {
+  const project = body?.cloudaicompanionProject ?? body?.cloudaicompanion_project
+  return cliProxyObject(project) ? cpaFirstText(project.id) : cpaFirstText(project)
+}
+
+function cliProxyGooglePlan(body) {
+  return cpaFirstText(body?.paidTier?.name, body?.paid_tier?.name, body?.currentTier?.name, body?.currentTier?.id, body?.current_tier?.name, body?.current_tier?.id) || cliProxyPlanFromBody(body)
+}
+
+function cliProxyKimiPrefersAi(entry) {
+  const hints = [entry?.domain, cliProxyPath(entry, 'metadata', 'domain'), cliProxyPath(entry, 'attributes', 'domain'), entry?.base_url, cliProxyPath(entry, 'metadata', 'base_url'), cliProxyPath(entry, 'attributes', 'base_url'), entry?.provider, entry?.type, entry?.name, entry?.id]
+  for (const value of hints) {
+    const hint = cpaSafeText(value, 120).toLowerCase()
+    if (hint === '') continue
+    if (['ai', 'kimi-ai', 'kimi_ai', 'kimi.ai'].includes(hint) || /(?:^|[./])kimi\.ai(?:[/:]|$)/.test(hint)) return true
+    if (['com', 'kimi', 'kimi.com'].includes(hint) || /(?:^|[./])kimi\.com(?:[/:]|$)/.test(hint)) return false
+  }
+  return /kimi[-_.]ai/i.test(`${cpaSafeText(entry?.id)} ${cpaSafeText(entry?.name)}`)
+}
+
+function cliProxyKimiWindows(body) {
+  const rows = []
+  const add = (raw, label, duration, unit, fallbackTier = 'other') => {
+    if (!cliProxyObject(raw)) return
+    const limit = toFinite(raw.limit)
+    const usedAmount = toFinite(raw.used)
+    const remainingAmount = toFinite(raw.remaining)
+    let remaining
+    if (limit !== undefined && limit > 0) {
+      if (remainingAmount !== undefined) remaining = remainingAmount / limit * 100
+      else if (usedAmount !== undefined) remaining = 100 - usedAmount / limit * 100
+    }
+    let tier = cliProxyTier(label)
+    if (tier === 'other' && toFinite(duration) !== undefined) {
+      const amount = toFinite(duration)
+      const u = cpaSafeText(unit, 24).toLowerCase()
+      const seconds = u.startsWith('week') ? amount * 604800 : u.startsWith('day') ? amount * 86400 : u.startsWith('hour') ? amount * 3600 : amount * 60
+      if (seconds === 18_000) tier = 'five_hour'
+      else if (seconds === 604_800) tier = 'weekly'
+      else if (seconds >= 28 * 86400 && seconds <= 31 * 86400) tier = 'monthly'
+    }
+    if (tier === 'other' && label === 'usage') tier = fallbackTier
+    const resetAt = cliProxyEpoch(raw.reset_at ?? raw.resetAt ?? raw.reset_time ?? raw.resetTime) ?? cliProxyRelativeReset(raw.reset_in ?? raw.resetIn ?? raw.ttl)
+    const window = cliProxyWindow(tier, remaining === undefined ? (usedAmount !== undefined && limit !== undefined && limit > 0 ? usedAmount / limit * 100 : undefined) : 100 - remaining, resetAt, tier === 'other' ? label : '')
+    if (window !== undefined) rows.push(window)
+  }
+  if (Array.isArray(body?.limits)) {
+    body.limits.forEach((item, index) => {
+      if (!cliProxyObject(item)) return
+      const detail = cliProxyObject(item.detail) ? item.detail : item
+      const win = cliProxyObject(item.window) ? item.window : {}
+      add(detail, cpaFirstText(detail.name, detail.title, detail.scope, item.name, item.title), win.duration ?? item.duration ?? detail.duration, win.timeUnit ?? item.timeUnit ?? detail.timeUnit)
+    })
+  }
+  if (cliProxyObject(body?.usage)) add(body.usage, 'usage', undefined, undefined, 'weekly')
+  return rows
+}
+
+function cliProxyXaiWindows(body, period) {
+  const config = cliProxyObject(body?.config) ? body.config : body
+  const rows = []
+  const current = cliProxyObject(config?.currentPeriod) ? config.currentPeriod : cliProxyObject(config?.current_period) ? config.current_period : {}
+  const periodEnd = cliProxyEpoch(current.end ?? config?.billingPeriodEnd ?? config?.billing_period_end)
+  const creditUsage = cliProxyPercent(config?.creditUsagePercent ?? config?.credit_usage_percent)
+  if (creditUsage !== undefined && period !== 'monthly') rows.push(cliProxyWindow('weekly', creditUsage, periodEnd, 'Credits'))
+  const val = (value) => cliProxyObject(value) ? toFinite(value.val) : toFinite(value)
+  const monthlyLimit = val(config?.monthlyLimit ?? config?.monthly_limit)
+  const used = val(config?.used)
+  if (monthlyLimit !== undefined && monthlyLimit > 0 && used !== undefined) {
+    rows.push(cliProxyWindow('monthly', used / monthlyLimit * 100, period === 'monthly' ? periodEnd : undefined, 'Monthly credits'))
+  }
+  const products = config?.productUsage ?? config?.product_usage
+  if (Array.isArray(products)) {
+    products.forEach((item, index) => {
+      if (!cliProxyObject(item)) return
+      const usage = cliProxyPercent(item.usagePercent ?? item.usage_percent)
+      if (usage === undefined) return
+      const product = cpaSafeText(item.product, 64) || `Product ${index + 1}`
+      rows.push(cliProxyWindow('weekly', usage, periodEnd, product))
+    })
+  }
+  return rows.filter(Boolean)
+}
+
+function cliProxyDevinResult(body) {
+  const status = cliProxyObject(body?.userStatus?.planStatus) ? body.userStatus.planStatus : {}
+  const planInfo = cliProxyObject(status.planInfo) ? status.planInfo : cliProxyObject(body?.planInfo) ? body.planInfo : {}
+  const rows = []
+  for (const [id, key] of [['daily', 'daily'], ['weekly', 'weekly']]) {
+    const remaining = cliProxyPercent(status[`${key}QuotaRemainingPercent`])
+    const resetAt = cliProxyEpoch(status[`${key}QuotaResetAtUnix`])
+    const window = cliProxyWindow(id === 'weekly' ? 'weekly' : 'other', remaining === undefined ? undefined : 100 - remaining, resetAt, id === 'daily' ? 'Daily' : '')
+    if (window !== undefined) rows.push(window)
+  }
+  if (rows.length === 0) throw new Error('CLIProxyAPI returned no Devin quota data')
+  return { windows: rows, planTier: cpaSafeText(planInfo.planName, 48) || undefined }
+}
+
+function cliProxyMetaResult(body) {
+  const usage = cliProxyObject(body?.subs_usage) ? body.subs_usage : {}
+  const rows = []
+  for (const [id, raw] of [['window', usage.window], ['weekly', usage.weekly]]) {
+    if (!cliProxyObject(raw)) continue
+    const used = cliProxyPercent(raw.used_percent)
+    const resetAt = cliProxyEpoch(raw.resets_at)
+    const mins = toFinite(raw.window_duration_mins)
+    const tier = id === 'weekly' ? 'weekly' : mins !== undefined && mins * 60 === 18_000 ? 'five_hour' : mins !== undefined && mins >= 28 * 1440 && mins <= 31 * 1440 ? 'monthly' : 'other'
+    const window = cliProxyWindow(tier, used, resetAt, tier === 'other' ? id : '')
+    if (window !== undefined) rows.push(window)
+  }
+  return { windows: rows, planTier: cpaSafeText(body?.subs_tier_name ?? usage.tier, 48) || undefined }
+}
+
+function cliProxyUpstreamError(status) {
+  const error = new Error('CLIProxyAPI upstream request failed')
+  error.kind = status === 401 ? 'auth' : status === 403 ? 'forbidden' : status === 404 ? 'unsupported' : 'http'
+  return error
+}
+
+async function cliProxyManagementApiCall(origin, managementKey, payload) {
+  const response = await fetchCliProxyJson(`${origin}/v0/management/api-call`, managementKey, { method: 'POST', body: payload })
+  if (!cliProxyObject(response)) throw new Error('CLIProxyAPI api-call response has an unexpected shape')
+  const status = toFinite(response.status_code ?? response.statusCode ?? response.status)
+  if (status === undefined) throw new Error('CLIProxyAPI api-call response has no status')
+  if (status < 200 || status >= 300) throw cliProxyUpstreamError(status)
+  const body = cliProxyUnwrap(response.body ?? response.data)
+  if (!cliProxyObject(body)) throw new Error('CLIProxyAPI upstream response has an unexpected shape')
+  return body
+}
+
+function cliProxyApiCall(origin, managementKey, authIndex, method, url, header, data = undefined) {
+  return cliProxyManagementApiCall(origin, managementKey, {
+    auth_index: authIndex,
+    method,
+    url,
+    header,
+    ...(data === undefined ? {} : { data: JSON.stringify(data) }),
+  })
+}
+
+async function cliProxyLoadGoogleProject(origin, managementKey, authIndex, metadata, antigravity = false) {
+  const header = antigravity ? cliProxyAntigravityHeaders() : cliProxyGoogleHeaders(metadata)
+  return cliProxyApiCall(origin, managementKey, authIndex, 'POST', CLI_PROXY_UPSTREAM.googleLoad, header, { metadata })
+}
+
+async function cliProxyProbeBuiltin(origin, managementKey, file, details, normalizedProvider) {
+  const authIndex = details.authIndex
+  const api = (method, url, header, data) => cliProxyApiCall(origin, managementKey, authIndex, method, url, header, data)
+  if (normalizedProvider === 'codex') {
+    const header = { Authorization: 'Bearer $TOKEN$', 'Content-Type': 'application/json', 'User-Agent': 'codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal' }
+    const accountId = cpaFirstText(file.chatgpt_account_id, file.account_id, cliProxyPath(file, 'tokens', 'account_id'), cliProxyPath(file, 'tokens', 'chatgpt_account_id'), cliProxyPath(file, 'metadata', 'account_id'), cliProxyPath(file, 'attributes', 'account_id'))
+    if (accountId !== '') header['Chatgpt-Account-Id'] = accountId
+    const body = await api('GET', CLI_PROXY_UPSTREAM.codexUsage, header)
+    return { windows: cliProxyCodexWindows(body), planTier: cliProxyPlanFromBody(body) }
+  }
+  if (normalizedProvider === 'claude') {
+    const header = { Authorization: 'Bearer $TOKEN$', 'Content-Type': 'application/json', 'anthropic-beta': 'oauth-2025-04-20' }
+    const [usage, profile] = await Promise.all([
+      api('GET', CLI_PROXY_UPSTREAM.claudeUsage, header),
+      api('GET', CLI_PROXY_UPSTREAM.claudeProfile, header).catch(() => undefined),
+    ])
+    return { windows: cliProxyClaudeWindows(usage), planTier: cliProxyClaudePlan(profile) ?? cliProxyPlanFromBody(usage) }
+  }
+  if (normalizedProvider === 'gemini-cli') {
+    const metadata = { ideType: 'IDE_UNSPECIFIED', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' }
+    let project = cliProxyProjectId(file)
+    let plan
+    let planRequest
+    if (project === '') {
+      const loaded = await cliProxyLoadGoogleProject(origin, managementKey, authIndex, metadata)
+      project = cliProxyGoogleProject(loaded)
+      plan = cliProxyGooglePlan(loaded)
+    } else {
+      planRequest = cliProxyLoadGoogleProject(origin, managementKey, authIndex, metadata).then(cliProxyGooglePlan, () => undefined)
+    }
+    if (project === '') throw new Error('CLIProxyAPI Gemini project is unavailable')
+    const body = await api('POST', CLI_PROXY_UPSTREAM.googleQuota, cliProxyGoogleHeaders({ ...metadata, duetProject: project }), { project })
+    if (planRequest !== undefined) plan = (await planRequest) || plan
+    return { windows: geminiWindows(Array.isArray(body.buckets) ? body.buckets : []), planTier: plan }
+  }
+  if (normalizedProvider === 'antigravity') {
+    const metadata = { ideType: 'ANTIGRAVITY', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' }
+    let project = cliProxyProjectId(file)
+    let plan
+    let planRequest
+    if (project === '') {
+      const loaded = await cliProxyLoadGoogleProject(origin, managementKey, authIndex, metadata, true)
+      project = cliProxyGoogleProject(loaded)
+      plan = antigravityPlanTier(loaded) ?? cliProxyGooglePlan(loaded)
+    } else {
+      planRequest = cliProxyLoadGoogleProject(origin, managementKey, authIndex, metadata, true).then((body) => antigravityPlanTier(body) ?? cliProxyGooglePlan(body), () => undefined)
+    }
+    if (project === '') throw new Error('CLIProxyAPI Antigravity project is unavailable')
+    const windowsByKey = new Map()
+    let lastError
+    for (const url of CLI_PROXY_UPSTREAM.antigravityQuota) {
+      try {
+        const body = await api('POST', url, cliProxyAntigravityHeaders(), { project })
+        plan = plan || antigravityPlanTier(body) || cliProxyGooglePlan(body)
+        for (const window of antigravitySummaryWindows(body)) {
+          const key = `${window.tier}:${window.name ?? ''}`
+          if (!windowsByKey.has(key)) windowsByKey.set(key, window)
+        }
+        if ([...windowsByKey.values()].some((window) => /gemini/i.test(`${window.tier} ${window.name ?? ''}`))) break
+      } catch (error) {
+        lastError = error
+      }
+    }
+    let windows = [...windowsByKey.values()]
+    if (!windows.some((window) => /gemini/i.test(`${window.tier} ${window.name ?? ''}`))) {
+      try {
+        const body = await api('POST', CLI_PROXY_UPSTREAM.googleQuota, cliProxyAntigravityHeaders(), { project })
+        windows = [...windows, ...geminiWindows(Array.isArray(body.buckets) ? body.buckets : [])]
+        plan = plan || antigravityPlanTier(body) || cliProxyGooglePlan(body)
+      } catch (error) {
+        lastError = lastError ?? error
+      }
+    }
+    if (planRequest !== undefined) plan = (await planRequest) || plan
+    if (windows.length === 0) throw lastError ?? new Error('CLIProxyAPI Antigravity quota is unavailable')
+    return { windows, planTier: plan }
+  }
+  if (normalizedProvider === 'kimi') {
+    const hosts = cliProxyKimiPrefersAi(file) ? [CLI_PROXY_UPSTREAM.kimiAi, CLI_PROXY_UPSTREAM.kimi] : [CLI_PROXY_UPSTREAM.kimi, CLI_PROXY_UPSTREAM.kimiAi]
+    let lastError
+    for (const url of hosts) {
+      try {
+        const body = await api('GET', url, { Authorization: 'Bearer $TOKEN$' })
+        return { windows: cliProxyKimiWindows(body), planTier: cliProxyPlanFromBody(body) }
+      } catch (error) {
+        lastError = error
+        if (!['auth', 'forbidden'].includes(error?.kind)) break
+      }
+    }
+    throw lastError ?? new Error('CLIProxyAPI Kimi quota is unavailable')
+  }
+  if (normalizedProvider === 'xai') {
+    const header = {
+      Authorization: 'Bearer $TOKEN$',
+      'x-xai-token-auth': 'xai-grok-cli',
+      'x-grok-client-version': '0.2.91',
+      accept: '*/*',
+      'user-agent': 'grok-pager/0.2.91 grok-shell/0.2.91 (windows; amd64)',
+    }
+    const userId = cpaFirstText(file.sub, file.subject, file.user_id, file.userId, cliProxyPath(file, 'metadata', 'sub'), cliProxyPath(file, 'metadata', 'user_id'), cliProxyPath(file, 'attributes', 'sub'))
+    if (userId !== '') header['x-userid'] = userId
+    const [weekly, monthly] = await Promise.allSettled([
+      api('GET', CLI_PROXY_UPSTREAM.xaiWeekly, header),
+      api('GET', CLI_PROXY_UPSTREAM.xaiMonthly, header),
+    ])
+    if (weekly.status === 'rejected' && monthly.status === 'rejected') throw weekly.reason
+    const windows = [
+      ...(weekly.status === 'fulfilled' ? cliProxyXaiWindows(weekly.value, 'weekly') : []),
+      ...(monthly.status === 'fulfilled' ? cliProxyXaiWindows(monthly.value, 'monthly') : []),
+    ]
+    return { windows, planTier: windows.length === 0 ? 'Paid' : undefined }
+  }
+  if (normalizedProvider === 'devin') {
+    const body = await api('POST', CLI_PROXY_UPSTREAM.devin, { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1' }, {
+      metadata: { ideName: 'chisel', ideVersion: '3000.10.21', apiKey: '$TOKEN$', locale: 'en', os: 'darwin', extensionVersion: '3000.10.21', clientName: 'chisel' },
+    })
+    return cliProxyDevinResult(body)
+  }
+  if (normalizedProvider === 'meta') {
+    const name = cpaFirstText(file.name, file.id)
+    if (name === '' || cpaFlag(file.runtime_only ?? file.runtimeOnly)) throw new Error('CLIProxyAPI Meta token is unavailable')
+    const downloaded = await fetchCliProxyJson(`${origin}/v0/management/auth-files/download?name=${encodeURIComponent(name)}`, managementKey)
+    const token = cliProxyUnwrap(downloaded)?.dca_token
+    if (typeof token !== 'string' || !/^dca:\S+$/.test(token)) throw new Error('CLIProxyAPI Meta token is unavailable')
+    const body = await api('POST', CLI_PROXY_UPSTREAM.meta, { Accept: 'application/json', 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'x-api-version': '1.0.0' }, {})
+    return cliProxyMetaResult(body)
+  }
+  throw new Error('CLIProxyAPI provider is unsupported')
+}
+
+function cliProxyEpoch(value) {
+  if (typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()))) {
+    const number = Number(value)
+    if (!Number.isFinite(number) || number <= 0) return undefined
+    const milliseconds = number > 1e12 ? number : number * 1000
+    return Number.isFinite(milliseconds) ? milliseconds : undefined
+  }
+  if (typeof value === 'string') {
+    const milliseconds = Date.parse(value)
+    return Number.isFinite(milliseconds) ? milliseconds : undefined
+  }
+  return undefined
+}
+
+function cliProxyPercent(value, fraction = false) {
+  if (typeof value === 'string' && value.trim().endsWith('%')) value = value.trim().slice(0, -1)
+  const number = toFinite(value)
+  if (number === undefined) return undefined
+  const percent = fraction && number >= 0 && number <= 1 ? number * 100 : number
+  return Math.max(0, Math.min(100, percent))
+}
+
+function cliProxyTier(...values) {
+  const label = values.map((value) => cpaSafeText(value, 64).toLowerCase()).filter(Boolean).join(' ')
+  if (/(?:5\s*[-_ ]?h|five\s*[-_ ]?hour|300\s*min)/.test(label)) return 'five_hour'
+  if (/(?:weekly|week|7\s*[-_ ]?d|seven\s*[-_ ]?day)/.test(label)) return 'weekly'
+  if (/(?:monthly|month|30\s*[-_ ]?d)/.test(label)) return 'monthly'
+  return 'other'
+}
+
+function cliProxyQuotaWindows(rawPayload) {
+  const payload = cliProxyUnwrap(rawPayload)
+  if (payload === null || typeof payload !== 'object') return []
+  const rows = []
+  const add = (bucket, groupLabel = '') => {
+    if (bucket === null || typeof bucket !== 'object' || Array.isArray(bucket)) return
+    const bucketLabel = cpaFirstText(bucket.displayName, bucket.display_name, bucket.label, bucket.name, bucket.bucketId, bucket.bucket_id)
+    const tier = cliProxyTier(bucket.window, bucket.windowType, bucket.window_type, bucket.duration, bucketLabel, groupLabel)
+    let remaining = cliProxyPercent(bucket.remainingFraction ?? bucket.remaining_fraction, true)
+    if (remaining === undefined) remaining = cliProxyPercent(bucket.remainingPercent ?? bucket.remaining_percent ?? bucket.remaining)
+    let used = cliProxyPercent(bucket.usedPercent ?? bucket.used_percent)
+    if (used === undefined && remaining === undefined) {
+      const amount = toFinite(bucket.used ?? bucket.consumed)
+      const limit = toFinite(bucket.limit ?? bucket.total)
+      if (amount !== undefined && limit !== undefined && limit > 0) used = Math.max(0, Math.min(100, amount / limit * 100))
+    }
+    if (used === undefined && remaining !== undefined) used = 100 - remaining
+    if (remaining === undefined && used !== undefined) remaining = 100 - used
+    if (used === undefined && remaining === undefined) return
+
+    const resetAt = cliProxyEpoch(bucket.resetTime ?? bucket.reset_time ?? bucket.resetAt ?? bucket.reset_at ?? bucket.resetsAt ?? bucket.resets_at)
+    const nameParts = [groupLabel, bucketLabel].filter((part, index, list) => part !== '' && list.indexOf(part) === index)
+    const windowName = (tier === 'other' || nameParts.length > 1) ? nameParts.join(' · ') : ''
+    rows.push({
+      tier,
+      usedPercent: used,
+      ...(resetAt === undefined ? {} : { resetAt }),
+      ...(windowName === '' ? {} : { name: windowName }),
+    })
+  }
+
+  if (Array.isArray(payload.windows)) {
+    for (const window of payload.windows) add(window)
+  }
+  if (Array.isArray(payload.groups)) {
+    for (const group of payload.groups) {
+      if (group === null || typeof group !== 'object' || Array.isArray(group)) continue
+      const groupLabel = cpaFirstText(group.displayName, group.display_name, group.label, group.name, group.id)
+      const buckets = Array.isArray(group.buckets) ? group.buckets : Array.isArray(group.windows) ? group.windows : []
+      for (const bucket of buckets) add(bucket, groupLabel)
+      if (buckets.length === 0) add(group, groupLabel)
+    }
+  }
+  return rows
+}
+
+function cliProxyPlan(payload) {
+  const subscription = payload !== null && typeof payload === 'object' ? payload.subscription : undefined
+  const plan = cpaFirstText(subscription?.tierName, subscription?.tier_name, subscription?.plan, subscription?.tierId, subscription?.tier_id)
+  return plan === '' ? undefined : plan.slice(0, 48)
+}
+
+function cliProxyErrorEntry(provider, providerName, error, fetchedAt = Date.now()) {
+  const kind = error?.kind === 'auth' || error?.kind === 'forbidden' || error?.kind === 'unsupported'
+    ? error.kind
+    : 'http'
+  return { status: 'error', provider, providerName, fetchedAt, error: { kind } }
+}
+
+function cliProxyAuthIndex(file) {
+  const value = file.auth_index ?? file.authIndex ?? file.index
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0 ? String(value) : ''
+  if (typeof value !== 'string') return ''
+  const index = value.trim()
+  return index.length > 0 && index.length <= 256 && !/[\u0000-\u001f\u007f]/.test(index) ? index : ''
+}
+
+function cliProxyPublicProvider(sourceProvider) {
+  const normalized = cliProxyNormalizeProvider(sourceProvider)
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(normalized) ? normalized : 'plugin'
+}
+
+function cliProxyFileEntry(file, index) {
+  const indexText = cliProxyAuthIndex(file)
+  const ordinal = String(index + 1)
+  const internalName = cpaFirstText(file.name, file.id, indexText, `auth-file-${ordinal}`)
+  const sourceProvider = cpaFirstText(file.provider, file.quota_provider, file.quotaProvider, file.type)
+  const publicProvider = cliProxyPublicProvider(sourceProvider)
+  const provider = `cli-proxy-${cpaSlug(publicProvider)}-${ordinal}`
+  const providerName = `CLIProxy · ${cpaProviderLabel(publicProvider)} · Account #${ordinal}`.slice(0, 120)
+  return {
+    provider,
+    providerName,
+    markProvider: publicProvider,
+    internalName,
+    sourceProvider,
+    authIndex: indexText,
+  }
+}
+
+async function mapConcurrent(items, concurrency, fn) {
+  const output = new Array(items.length)
+  let next = 0
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++
+      output[index] = await fn(items[index], index)
+    }
+  }))
+  return output
+}
+
+async function fetchCliProxyAuthQuota(ctx, origin, managementKey) {
+  const list = await fetchCliProxyJson(`${origin}/v0/management/auth-files`, managementKey)
+  const files = Array.isArray(list) ? list : list?.files ?? list?.auth_files ?? list?.authFiles
+  if (!Array.isArray(files)) throw new Error('CLIProxyAPI auth-files response has an unexpected shape')
+
+  const seen = new Set()
+  const supported = files.slice(0, CLI_PROXY_MAX_AUTH_FILES).filter((file) => {
+    if (file === null || typeof file !== 'object' || Array.isArray(file)) return false
+    const status = cpaFirstText(file.status).toLowerCase()
+    if (cpaFlag(file.disabled) || status === 'disabled' || status === 'unavailable') return false
+    const name = cpaFirstText(file.name, file.id, file.auth_index, file.authIndex)
+    const authIndex = cliProxyAuthIndex(file)
+    const sourceProvider = cpaFirstText(file.provider, file.quota_provider, file.quotaProvider, file.type)
+    const normalizedProvider = cliProxyNormalizeProvider(sourceProvider)
+    const builtin = CLI_PROXY_BUILTIN_PROVIDERS.has(normalizedProvider)
+    const pluginQuota = cpaFlag(file.supports_quota ?? file.supportsQuota)
+    if (!builtin && !pluginQuota) return false
+    const identity = authIndex === '' ? `${normalizedProvider}\u0000${name.toLowerCase()}` : `index:${authIndex}`
+    if (name === '' || seen.has(identity)) return false
+    seen.add(identity)
+    return true
+  })
+
+  return await mapConcurrent(supported, CLI_PROXY_MAX_CONCURRENCY, async (file, index) => {
+    const details = cliProxyFileEntry(file, index)
+    if (details.authIndex === '') return cliProxyErrorEntry(details.provider, details.providerName, { kind: 'unsupported' })
+    try {
+      const normalizedProvider = cliProxyNormalizeProvider(details.sourceProvider)
+      if (CLI_PROXY_BUILTIN_PROVIDERS.has(normalizedProvider)) {
+        const result = await cliProxyProbeBuiltin(origin, managementKey, file, details, normalizedProvider)
+        return {
+          status: 'ok',
+          provider: details.provider,
+          providerName: details.providerName,
+          markProvider: details.markProvider,
+          ...(result.planTier === undefined ? {} : { planTier: result.planTier }),
+          fetchedAt: Date.now(),
+          windows: Array.isArray(result.windows) ? result.windows : [],
+        }
+      }
+      const body = await fetchCliProxyJson(`${origin}/v0/management/quota/fetch`, managementKey, {
+        method: 'POST',
+        body: {
+          auth_index: details.authIndex,
+          ...(details.sourceProvider === '' ? {} : { provider: details.sourceProvider }),
+        },
+      })
+      const payload = cliProxyUnwrap(body)
+      if (payload === undefined) throw new Error('CLIProxyAPI quota response has an unexpected shape')
+      const planTier = cliProxyPlan(payload)
+      return {
+        status: 'ok',
+        provider: details.provider,
+        providerName: details.providerName,
+        markProvider: details.markProvider,
+        ...(planTier === undefined ? {} : { planTier }),
+        fetchedAt: Date.now(),
+        windows: cliProxyQuotaWindows(payload),
+      }
+    } catch (error) {
+      return cliProxyErrorEntry(details.provider, details.providerName, error)
+    }
+  })
+}
+
+/** One row per quota-capable CLIProxyAPI auth file; public rows contain no secrets. */
+async function queryCliProxyQuota(ctx, options) {
+  const managementKey = await readCliProxyManagementKey(ctx)
+  if (managementKey === undefined) return []
+  const origin = cliProxyManagementOrigin(await readCliProxyManagementUrl(ctx))
+  if (origin === undefined) return [cliProxyErrorEntry('cli-proxy-api', 'CLIProxyAPI', new Error('invalid management URL'))]
+
+  const generation = cliProxyCacheGeneration
+  const cached = cliProxyCache.get(origin)
+  if (cached !== undefined && cached.generation === generation) {
+    const age = Date.now() - cached.at
+    const floor = options.refresh === true ? CLI_PROXY_REFRESH_FLOOR_MS : CLI_PROXY_CACHE_TTL_MS
+    if (age < floor) return cached.providers
+  }
+  const inflightKey = `${origin}\u0000${generation}`
+  const running = cliProxyInflight.get(inflightKey)
+  if (running !== undefined) return running
+
+  const query = (async () => {
+    try {
+      const providers = await fetchCliProxyAuthQuota(ctx, origin, managementKey)
+      if (cliProxyCacheGeneration === generation) {
+        cliProxyCache.set(origin, { generation, at: Date.now(), providers })
+      }
+      return providers
+    } catch (error) {
+      return [cliProxyErrorEntry('cli-proxy-api', 'CLIProxyAPI', error)]
+    }
+  })()
+  cliProxyInflight.set(inflightKey, query)
+  try {
+    return await query
+  } finally {
+    cliProxyInflight.delete(inflightKey)
+  }
+}
+
 const ADAPTERS = {
   'opencode-go': { needsApiKey: true, query: queryOpencodeGo },
   'command-code': { needsApiKey: true, query: queryCommandCode },
@@ -1397,7 +2350,7 @@ async function readApiKey(ctx, provider) {
   // process environment, so a key saved in Settings beats a stray shell value.
   for (const envName of envNames) {
     try {
-      const resolved = await ctx.credentials.resolve(envName)
+      const resolved = await credentialsOf(ctx)?.resolve?.(envName)
       if (resolved !== null && typeof resolved === 'object' && typeof resolved.value === 'string' && resolved.value !== '') {
         return resolved.value
       }
@@ -1517,19 +2470,253 @@ async function snapshot(ctx, options) {
     eligible.push(provider)
   }
 
-  const results = await Promise.all(eligible.map(async (provider) => {
-    if (provider === 'command-code') {
-      const entries = await queryCommandCodeUsage(options)
-      // The shared service answered (even with no chip to draw): never ask the
-      // billing endpoints behind its back.
-      if (entries !== undefined) return entries
-    }
-    return [await queryProvider(ctx, provider, options)]
-  }))
+  const [results, cliProxyProviders] = await Promise.all([
+    Promise.all(eligible.map(async (provider) => {
+      if (provider === 'command-code') {
+        const entries = await queryCommandCodeUsage(options)
+        // The shared service answered (even with no chip to draw): never ask the
+        // billing endpoints behind its back.
+        if (entries !== undefined) return entries
+      }
+      return [await queryProvider(ctx, provider, options)]
+    })),
+    queryCliProxyQuota(ctx, options),
+  ])
 
   return {
     intervalSec: DEFAULT_INTERVAL_SEC,
-    providers: results.flat().filter((entry) => entry !== undefined),
+    providers: [...results.flat().filter((entry) => entry !== undefined), ...cliProxyProviders],
+  }
+}
+
+function settingsResponse(res, status, payload) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  })
+  res.end(JSON.stringify(payload))
+}
+
+function admitSettingsRequest(ctx, req, res, expectedMethod) {
+  if (req.method !== expectedMethod) {
+    settingsResponse(res, 405, { error: 'method-not-allowed' })
+    return false
+  }
+
+  // `webServer.getOrigin()` describes the Web listener, not the Desktop
+  // document's API mount. Use DSH Connection's Host/Origin and browser-auth
+  // checks, which also admit the Desktop shell's authenticated no-Origin calls.
+  const connection = ctx.get?.('connection')
+  if (typeof connection?.requestRejection !== 'function') {
+    settingsResponse(res, 503, { error: 'request-security-unavailable' })
+    return false
+  }
+
+  if (expectedMethod === 'POST') {
+    const headers = req.headers ?? {}
+    if (headers['sec-fetch-site'] === 'cross-site') {
+      settingsResponse(res, 403, { error: 'same-origin-required' })
+      return false
+    }
+    const suppliedOrigin = headers.origin
+    if (suppliedOrigin !== undefined) {
+      const host = headers.host
+      let sameAuthority = false
+      try {
+        sameAuthority = typeof suppliedOrigin === 'string'
+          && typeof host === 'string'
+          && new URL(suppliedOrigin).host.toLowerCase() === host.toLowerCase()
+      } catch {
+        // An invalid Origin is rejected below without echoing it.
+      }
+      if (!sameAuthority) {
+        settingsResponse(res, 403, { error: 'same-origin-required' })
+        return false
+      }
+    }
+  }
+
+  let rejection
+  try {
+    rejection = connection.requestRejection(req)
+  } catch {
+    rejection = 403
+  }
+  if (rejection !== undefined) {
+    const status = rejection === 401 || rejection === 403 ? rejection : 403
+    settingsResponse(res, status, { error: 'request-rejected' })
+    return false
+  }
+  return true
+}
+
+function settingsRouteError(status, code) {
+  const error = new Error(code)
+  error.status = status
+  return error
+}
+
+/** Return only a safe, allowlisted credential-store diagnosis; never expose paths or input. */
+function safeCredentialFailureReason(error) {
+  switch (error?.code) {
+    case 'EACCES':
+    case 'EPERM': return 'credential-store-permission-denied'
+    case 'EROFS': return 'credential-store-read-only'
+    case 'ENOSPC':
+    case 'EDQUOT': return 'credential-store-no-space'
+    case 'ENOENT':
+    case 'ENOTDIR': return 'credential-store-path-unavailable'
+    case 'EBUSY':
+    case 'ETIMEDOUT': return 'credential-store-lock-timeout'
+  }
+  const message = typeof error?.message === 'string' ? error.message : ''
+  if (message.includes('pre-release flat layout')) return 'credential-store-migration-required'
+  if (message.includes('invalid document') || message.includes('must be a mapping')) {
+    return 'credential-store-document-invalid'
+  }
+  if (message.includes('declares version')) return 'credential-store-version-unsupported'
+  if (message.includes('readable beyond its owner')) return 'credential-store-permissions-unsafe'
+  return 'credential-store-write-failed'
+}
+
+async function readSettingsBody(req) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    size += bytes.byteLength
+    if (size > SETTINGS_MAX_BODY_BYTES) throw settingsRouteError(413, 'settings-body-too-large')
+    chunks.push(bytes)
+  }
+  let body
+  try {
+    body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    throw settingsRouteError(400, 'invalid-settings-body')
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw settingsRouteError(400, 'invalid-settings-body')
+  }
+  const allowed = new Set(['managementUrl', 'managementKey', 'clearManagementUrl', 'clearManagementKey'])
+  if (Object.keys(body).some((key) => !allowed.has(key))) {
+    throw settingsRouteError(400, 'invalid-settings-fields')
+  }
+  return body
+}
+
+async function cliProxySettingsSnapshot(ctx) {
+  const credentials = credentialsOf(ctx)
+  const managementUrl = await readCliProxyManagementUrl(ctx)
+  let managementKeyConfigured
+  try {
+    const info = await credentials?.describe?.(CLI_PROXY_MANAGEMENT_KEY_REF)
+    if (typeof info?.configured === 'boolean') managementKeyConfigured = info.configured
+  } catch {
+    // Use resolve below as a compatibility fallback for credential providers.
+  }
+  if (managementKeyConfigured === undefined) {
+    managementKeyConfigured = (await readCliProxyManagementKey(ctx)) !== undefined
+  }
+  return {
+    managementUrl,
+    managementUrlValid: cliProxyManagementOrigin(managementUrl) !== undefined,
+    managementKeyConfigured,
+  }
+}
+
+async function handleCliProxySettings(req, res, ctx) {
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    settingsResponse(res, 405, { error: 'method-not-allowed' })
+    return
+  }
+  if (!admitSettingsRequest(ctx, req, res, req.method)) return
+
+  if (req.method === 'GET') {
+    try {
+      settingsResponse(res, 200, await cliProxySettingsSnapshot(ctx))
+    } catch {
+      settingsResponse(res, 500, { error: 'settings-unavailable' })
+    }
+    return
+  }
+  const contentType = req.headers?.['content-type']
+  if (typeof contentType !== 'string' || contentType.split(';', 1)[0].trim().toLowerCase() !== 'application/json') {
+    settingsResponse(res, 415, { error: 'application-json-required' })
+    return
+  }
+
+  let body
+  try {
+    body = await readSettingsBody(req)
+  } catch (error) {
+    settingsResponse(res, error?.status ?? 400, { error: error?.message ?? 'invalid-settings-body' })
+    return
+  }
+
+  const hasManagementUrl = Object.hasOwn(body, 'managementUrl')
+  const hasManagementKey = Object.hasOwn(body, 'managementKey')
+  const clearManagementUrl = body.clearManagementUrl === true
+  const clearManagementKey = body.clearManagementKey === true
+  if ((hasManagementUrl && typeof body.managementUrl !== 'string')
+    || (hasManagementKey && typeof body.managementKey !== 'string')
+    || (Object.hasOwn(body, 'clearManagementUrl') && typeof body.clearManagementUrl !== 'boolean')
+    || (Object.hasOwn(body, 'clearManagementKey') && typeof body.clearManagementKey !== 'boolean')
+    || (hasManagementUrl && clearManagementUrl)
+    || (hasManagementKey && clearManagementKey)
+    || (hasManagementUrl && body.managementUrl.length > 2048)
+    || (hasManagementKey && body.managementKey.length > 8192)) {
+    settingsResponse(res, 400, { error: 'invalid-settings-value' })
+    return
+  }
+
+  const rawUrl = hasManagementUrl ? body.managementUrl.trim() : undefined
+  if (rawUrl !== undefined && rawUrl !== '' && cliProxyManagementOrigin(rawUrl) === undefined) {
+    settingsResponse(res, 400, { error: 'invalid-management-url' })
+    return
+  }
+  const rawKey = hasManagementKey ? body.managementKey.trim() : undefined
+  if (rawKey !== undefined && rawKey.length > 8192) {
+    settingsResponse(res, 400, { error: 'invalid-management-key' })
+    return
+  }
+  const changeUrl = hasManagementUrl || clearManagementUrl
+  const changeKey = clearManagementKey || (rawKey !== undefined && rawKey !== '')
+  if (!changeUrl && !changeKey) {
+    settingsResponse(res, 400, { error: 'no-settings-to-save' })
+    return
+  }
+  const credentials = credentialsOf(ctx)
+  if (typeof credentials?.set !== 'function' || typeof credentials?.unset !== 'function') {
+    settingsResponse(res, 503, { error: 'credential-store-unavailable' })
+    return
+  }
+
+  let urlWriteCompleted = false
+  let keyWriteCompleted = false
+  try {
+    if (changeUrl) {
+      if (clearManagementUrl || rawUrl === '') await credentials.unset(CLI_PROXY_MANAGEMENT_URL_ENV)
+      else await credentials.set(CLI_PROXY_MANAGEMENT_URL_ENV, rawUrl)
+      urlWriteCompleted = true
+    }
+    if (changeKey) {
+      if (clearManagementKey) await credentials.unset(CLI_PROXY_MANAGEMENT_KEY_REF)
+      else await credentials.set(CLI_PROXY_MANAGEMENT_KEY_REF, rawKey)
+      keyWriteCompleted = true
+    }
+    if (urlWriteCompleted || keyWriteCompleted) invalidateCliProxyCache()
+    settingsResponse(res, 200, { ok: true, ...await cliProxySettingsSnapshot(ctx) })
+  } catch (error) {
+    if (urlWriteCompleted || keyWriteCompleted) invalidateCliProxyCache()
+    // Never serialize credential-service messages; they may contain a path or input value.
+    const completedWrites = Number(urlWriteCompleted) + Number(keyWriteCompleted)
+    const requestedWrites = Number(changeUrl) + Number(changeKey)
+    settingsResponse(res, 500, {
+      error: 'settings-save-failed',
+      reason: safeCredentialFailureReason(error),
+      ...(completedWrites > 0 && completedWrites < requestedWrites ? { partial: true } : {}),
+    })
   }
 }
 
@@ -1549,28 +2736,50 @@ export function apply(ctx) {
   })
 
   ctx.inject(['webServer'], (scope) => {
-    scope.effect(() => scope.webServer.register({
-      kind: 'exact',
-      path: QUOTA_PATH,
-      handler: async (req, res) => {
-        if (req.method !== 'GET') {
-          res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
-          res.end('method not allowed')
-          return
-        }
-        try {
-          const refresh = new URL(req.url ?? '/', 'http://localhost').searchParams.get('refresh') === '1'
-          const payload = await snapshot(ctx, { refresh })
-          res.writeHead(200, {
-            'content-type': 'application/json; charset=utf-8',
-            'cache-control': 'no-store',
-          })
-          res.end(JSON.stringify(payload))
-        } catch (error) {
-          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
-          res.end(JSON.stringify({ error: String(error?.message ?? error) }))
-        }
-      },
-    }), 'provider-quota: state route')
+    scope.effect(() => {
+      const disposers = []
+      try {
+        disposers.push(scope.webServer.register({
+          kind: 'exact',
+          path: QUOTA_PATH,
+          handler: async (req, res) => {
+            if (req.method !== 'GET') {
+              res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
+              res.end('method not allowed')
+              return
+            }
+            try {
+              const query = new URL(req.url ?? '/', 'http://localhost').searchParams
+              const refresh = query.get('refresh') === '1'
+              const payload = await snapshot(ctx, { refresh })
+              if (query.get('includeCliProxyProviders') === '1') {
+                // Opt-in diagnostic: return only names, cleaned service URLs,
+                // and disabled flags from CLIProxyAPI's compatibility list.
+                payload.cliProxyConfiguredProviders = await queryCliProxyConfiguredProviders(ctx)
+              }
+              res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+              })
+              res.end(JSON.stringify(payload))
+            } catch (error) {
+              res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+              res.end(JSON.stringify({ error: String(error?.message ?? error) }))
+            }
+          },
+        }))
+        disposers.push(scope.webServer.register({
+          kind: 'exact',
+          path: QUOTA_SETTINGS_PATH,
+          handler: (req, res) => handleCliProxySettings(req, res, ctx),
+        }))
+      } catch (error) {
+        for (const dispose of disposers.reverse()) dispose?.()
+        throw error
+      }
+      return () => {
+        for (const dispose of disposers.reverse()) dispose?.()
+      }
+    }, 'provider-quota: state and settings routes')
   })
 }

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Provider quota",
-    "description": "A compact row above the composer with plan usage (most binding window's remaining share and reset countdown) for opencode-go, command-code (also registered as `commandcode`, whose shared usage service is read when the upstream Command Code plugin is installed), the local Codex, Claude Code and Gemini CLI logins, and Antigravity's local service; hover a chip for every window in detail, and toggle display for each discovered provider in the quota row."
+    "description": "A compact quota row above the composer by default, with an optional quota summary and details panel above the sidebar account row. The two locations can be toggled independently. Configure provider visibility, display locations, and CLIProxyAPI management credentials in DSH Settings → Plugins → Provider quota. Supports opencode-go, command-code (also registered as `commandcode`, using the upstream plugin's shared usage service when available), local Codex / Claude Code / Gemini CLI / Antigravity, and CLIProxyAPI auth files that declare quota support."
   }
 }

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "供应商余量",
-    "description": "在输入框上方常驻一行，紧凑显示供应商套餐余量（最吃紧窗口的剩余比例与重置倒计时），包括 opencode-go / command-code（注册表 id `commandcode` 也认，装了上游 Command Code 插件时直接读它的共享用量服务）以及本地 Codex、Claude Code、Gemini CLI、Antigravity 的登录态；鼠标悬停展开各窗口明细，并可分别开关余量条中每个已发现供应商的余量展示。"
+    "description": "默认在输入框上方常驻一行，紧凑显示供应商套餐余量（最吃紧窗口的剩余比例与重置倒计时），也可独立启用登录信息上方的侧栏摘要与详情面板；包括 opencode-go / command-code（注册表 id `commandcode` 也认，装了上游 Command Code 插件时直接读它的共享用量服务）、本地 Codex / Claude Code / Gemini CLI / Antigravity，以及 CLIProxyAPI 中声明支持额度查询的认证文件。两处展示、供应商可见性和 CLIProxyAPI 管理地址/密钥均在 DSH **设置 → 插件 → 余量** 页面管理。"
   }
 }
